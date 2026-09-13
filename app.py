@@ -6,13 +6,13 @@ from scipy.signal import find_peaks
 import math
 
 st.set_page_config(
-    page_title="AI ECG Chẩn Đoán Toàn Diện YDS 2026",
+    page_title="AI ECG Chẩn Đoán Chuyên Khoa Toàn Diện (YDS 2026 Guidelines)",
     page_icon="🫀",
     layout="wide"
 )
 
 st.title("🫀 Hệ Thống AI Chẩn Đoán ECG Chuyên Khoa Toàn Diện (YDS 2026)")
-st.caption("Chuẩn hóa toàn diện: SVT nhĩ, AVNRT, AVRT, JET, Nhịp Nhanh Thất (VT / Rung thất / Xoắn đỉnh), Block Dẫn Truyền, Kích Thích Sớm & Bệnh Mạch Vành")
+st.caption("Cập nhật đầy đủ: Kiểm tra Nhiễu & Sai lệch điện cực (Checklist CAPS SCAN), Lớn nhĩ, Dày thất (Sokolow-Lyon, Cornell, Katz-Wachtel, Romhilt-Estes), Vành cấp/mạn, Dẫn truyền, SVT & VT")
 
 LEAD_GRID = [
     ["I",   "aVR", "V1", "V4"],
@@ -59,19 +59,27 @@ def extract_signal_from_roi(roi):
     return np.array(signal)
 
 # =========================================================================
-# 2. ĐO ĐẠC HÌNH THÁI VI THỂ & CÁC ĐẶC TRƯNG NHỊP NHANH
+# 2. ĐO ĐẠC HÌNH THÁI VI THỂ & ĐỘNG HỌC SÓNG ĐIỆN TÂM ĐỒ
 # =========================================================================
 def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
     default_props = {
         "r_amp": 0.0, "s_amp": 0.0, "q_amp": 0.0, "q_dur": 0.0,
         "st_shift": 0.0, "st_slope": "flat", "t_amp": 0.0, "t_morph": "normal",
         "qrs_w": 0.08, "pr_interval": 0.16, "pr_list": [], "rp_interval": 0.0,
-        "p_amp": 0.0, "p_detected": False, "p_inverted": False, "pseudo_r_prime": False,
+        "p_amp": 0.0, "p_pos_amp": 0.0, "p_neg_amp": 0.0, "p_neg_dur": 0.0,
+        "p_dur": 0.08, "p_peaks_dist": 0.0, "p_notched": False, "p_detected": False,
+        "p_inverted": False, "pseudo_r_prime": False, "vat": 0.03,
         "has_delta": False, "true_rsr": False, "slurred_s": False, "notched_r": False,
         "r_to_s_time": 0.0, "has_josephson": False, "left_rabbit_ear": False,
+        "is_flatline": False, "has_notch_sign": False,
         "r_peaks": [], "rr_intervals": [], "qrs_list": []
     }
     if len(raw_sig) < 40:
+        return default_props
+
+    amp_span_raw = np.max(raw_sig) - np.min(raw_sig)
+    if amp_span_raw < 1.0:
+        default_props["is_flatline"] = True
         return default_props
 
     cut_start = int(len(raw_sig) * 0.05)
@@ -92,7 +100,8 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
 
     r_amps, s_amps, q_amps, q_durs = [], [], [], []
     st_shifts, t_amps, qrs_widths, pr_intervals, p_amps = [], [], [], [], []
-    rp_intervals, r_to_s_times = [], []
+    p_pos_amps, p_neg_amps, p_neg_durs, p_durs_list = [], [], [], []
+    rp_intervals, r_to_s_times, vats = [], [], []
     st_slopes, t_morphs = [], []
     has_delta = False
     has_true_rsr = False
@@ -103,16 +112,18 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
     pseudo_r_prime = False
     has_josephson = False
     left_rabbit_ear = False
+    p_notched = False
+    p_peaks_dist_val = 0.0
 
     for r in peaks:
-        pr_zone = raw_sig[max(0, r - int(px_per_sec * 0.12)):max(0, r - int(px_per_sec * 0.04))]
+        pr_zone = raw_sig[max(0, r - int(px_per_sec * 0.14)):max(0, r - int(px_per_sec * 0.04))]
         baseline_val = np.median(pr_zone) if len(pr_zone) > 0 else np.median(raw_sig)
         sig = raw_sig - baseline_val
 
         r_val = max(0.0, (sig[r] / px_per_mv) * 10.0)
         r_amps.append(r_val)
 
-        # 1. Sóng Q
+        # 1. Đo sóng Q
         q_zone = sig[max(0, r - int(px_per_sec * 0.08)):r]
         if len(q_zone) > 0 and np.min(q_zone) < 0:
             q_peak_idx = np.argmin(q_zone)
@@ -132,10 +143,8 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             s_val = (abs(min(0.0, s_search[min_s_idx])) / px_per_mv) * 10.0
             s_amps.append(s_val)
 
-            # Dấu hiệu Brugada: thời gian từ bắt đầu R đến đáy sóng S
             r_to_s_times.append(min_s_idx / px_per_sec)
 
-            # Dấu hiệu Josephson: có khấc trên sườn xuống gần đáy sóng S
             if min_s_idx > 3:
                 s_downslope = s_search[:min_s_idx]
                 if np.sum(np.diff(np.sign(np.diff(s_downslope))) > 0) >= 1:
@@ -182,7 +191,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             t_amps.append(0.0)
             t_morphs.append("normal")
 
-        # 5. Độ rộng QRS
+        # 5. Độ rộng QRS và Thời gian xuất hiện nhánh nội điện (VAT)
         left_idx = r
         while left_idx > max(0, r - int(px_per_sec * 0.12)) and sig[left_idx] > 0.15 * sig[r]:
             left_idx -= 1
@@ -191,6 +200,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             right_idx += 1
         measured_qrs = (right_idx - left_idx) / px_per_sec
         qrs_widths.append(measured_qrs)
+        vats.append((r - left_idx) / px_per_sec)
 
         # 6. Sóng Delta
         delta_zone = sig[left_idx:r]
@@ -202,21 +212,44 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             if 0 < s1 < 0.55 * s2 and len(delta_zone) / px_per_sec >= 0.035:
                 has_delta = True
 
-        # 7. Sóng P trước QRS & Khoảng PR
-        p_zone_start = max(0, r - int(px_per_sec * 0.36))
+        # 7. Sóng P và khoảng PR chi tiết (Chương 3: Lớn nhĩ)
+        p_zone_start = max(0, r - int(px_per_sec * 0.38))
         p_zone_end = max(0, r - int(px_per_sec * 0.06))
         p_zone = sig[p_zone_start:p_zone_end]
         if len(p_zone) > 5:
-            p_pks, _ = find_peaks(p_zone, prominence=0.40)
+            p_pks, _ = find_peaks(p_zone, prominence=0.35)
             if len(p_pks) > 0:
                 p_idx = p_zone_start + p_pks[-1]
                 pr_dur = (r - p_idx) / px_per_sec
                 if 0.06 <= pr_dur <= 0.45:
                     pr_intervals.append(pr_dur)
-                    p_amps.append(min(4.5, (sig[p_idx] / px_per_mv) * 10.0))
+                    p_amp_val = (sig[p_idx] / px_per_mv) * 10.0
+                    p_amps.append(p_amp_val)
                     p_detected = True
 
-        # 8. Sóng P retro (sau QRS) & Khoảng RP (Phân biệt AVNRT vs AVRT)
+                # Đo độ rộng toàn phần của sóng P
+                p_pts = np.where(np.abs(p_zone) > 0.15 * (px_per_mv / 10.0))[0]
+                if len(p_pts) > 0:
+                    p_durs_list.append(len(p_pts) / px_per_sec)
+
+                # Kiểm tra dạng 2 đỉnh (Lưng lạc đà) ở DII
+                if len(p_pks) >= 2:
+                    p_notched = True
+                    p_peaks_dist_val = (p_pks[-1] - p_pks[-2]) / px_per_sec
+
+                # Kiểm tra 2 pha ở V1 (pha dương và pha âm)
+                p_pos_part = np.max(p_zone)
+                p_neg_part = np.min(p_zone)
+                p_pos_amps.append(max(0.0, (p_pos_part / px_per_mv) * 10.0))
+                if p_neg_part < 0:
+                    p_neg_amps.append((abs(p_neg_part) / px_per_mv) * 10.0)
+                    neg_pts = np.where(p_zone < -0.10 * (px_per_mv / 10.0))[0]
+                    p_neg_durs.append(len(neg_pts) / px_per_sec)
+                else:
+                    p_neg_amps.append(0.0)
+                    p_neg_durs.append(0.0)
+
+        # 8. Sóng P retro (sau QRS) & Khoảng RP
         retro_p_zone = sig[right_idx:min(len(sig), right_idx + int(px_per_sec * 0.22))]
         if len(retro_p_zone) > 4:
             retro_pks, _ = find_peaks(np.abs(retro_p_zone), prominence=0.45)
@@ -228,7 +261,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
                 if retro_p_zone[retro_pks[0]] > 0 and rp_dur < 0.09:
                     pseudo_r_prime = True
 
-        # 9. Tai thỏ rsR' ở V1: R > R' (tai thỏ trái cao hơn - VT) vs R' > R (tai thỏ phải cao hơn - SVT lệch hướng)
+        # 9. Tai thỏ rsR' ở V1
         sub_complex = sig[max(0, r - int(px_per_sec * 0.03)):min(len(sig), r + int(px_per_sec * 0.10))]
         if len(sub_complex) > 5:
             local_pks, _ = find_peaks(sub_complex, distance=int(px_per_sec * 0.020), prominence=2.0)
@@ -241,6 +274,9 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
     rr_list = np.diff(peaks) / px_per_sec if len(peaks) >= 2 else []
     avg_qrs = float(np.median(qrs_widths)) if qrs_widths else 0.08
     avg_qrs = max(0.06, min(avg_qrs, 0.25))
+
+    # Dấu hiệu Notch: trong các dao động hỗn loạn, vẫn thấy phức bộ QRS hẹp diễu hành xuyên qua với chu kỳ đều đặn
+    has_notch_sign = len(peaks) >= 4 and (float(np.std(rr_list)) / (np.median(rr_list) if np.median(rr_list) > 0 else 1.0) < 0.10)
 
     return {
         "r_amp": float(np.median(r_amps)) if r_amps else 0.0,
@@ -256,9 +292,16 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         "pr_list": pr_intervals,
         "rp_interval": float(np.median(rp_intervals)) if rp_intervals else 0.0,
         "p_amp": float(np.median(p_amps)) if p_amps else 1.0,
+        "p_pos_amp": float(np.median(p_pos_amps)) if p_pos_amps else 0.0,
+        "p_neg_amp": float(np.median(p_neg_amps)) if p_neg_amps else 0.0,
+        "p_neg_dur": float(np.median(p_neg_durs)) if p_neg_durs else 0.0,
+        "p_dur": float(np.median(p_durs_list)) if p_durs_list else 0.08,
+        "p_peaks_dist": p_peaks_dist_val,
+        "p_notched": p_notched,
         "p_detected": p_detected,
         "p_inverted": p_inverted,
         "pseudo_r_prime": pseudo_r_prime,
+        "vat": float(np.median(vats)) if vats else 0.03,
         "has_delta": has_delta,
         "true_rsr": has_true_rsr,
         "slurred_s": has_slurred_s,
@@ -266,6 +309,8 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         "r_to_s_time": float(np.median(r_to_s_times)) if r_to_s_times else 0.06,
         "has_josephson": has_josephson,
         "left_rabbit_ear": left_rabbit_ear,
+        "is_flatline": False,
+        "has_notch_sign": has_notch_sign,
         "r_peaks": peaks,
         "rr_intervals": rr_list,
         "qrs_list": qrs_widths
@@ -327,337 +372,246 @@ def process_ecg_dataset(pil_img: Image.Image):
     }
 
 # =========================================================================
-# 3. CHẨN ĐOÁN NHỊP NHANH TRÊN THẤT & NHỊP NHANH THẤT (YDS 2026 CHƯƠNG 11, 12, 13)
+# 3. CHẨN ĐOÁN NHIỄU & SAI LỆCH VỊ TRÍ ĐIỆN CỰC (YDS 2026 CHƯƠNG 2)
 # =========================================================================
-def evaluate_tachycardias_yds(data):
+def evaluate_artifacts_and_lead_reversals(leads):
     """
-    Tiêu chuẩn Sổ tay ĐTĐ YDS 2026:
-    - Nhịp nhanh trên thất xuất phát từ nhĩ (Chương 11):
-        + Nhịp nhanh xoang (HR > 100)
-        + Nhịp nhanh nhĩ đơn ổ: Sóng P khác P xoang, đồng dạng, PR bình thường, thấy đường đẳng điện
-        + Nhịp nhanh nhĩ đa ổ (MAT): HR > 100, nhịp không đều, >= 3 hình dạng sóng P khác nhau trên cùng chuyển đạo
-        + Rung nhĩ: Mất sóng P, thay bằng sóng f, RR hoàn toàn không đều (đáp ứng thất nhanh > 100 l/p)
-        + Cuồng nhĩ: Sóng F răng cưa (250-400 l/p), dẫn truyền cố định/thay đổi
-    - Nhịp nhanh trên thất xuất phát từ/quanh bộ nối (Chương 12):
-        + AVNRT (Slow-Fast): Nhịp đều (150-250 l/p), QRS hẹp, không thấy P hoặc sóng r' giả ở V1 / s giả ở DII
-        + AVNRT (Fast-Slow): Sóng P đảo ở DII/aVF, RP < PR và RP <= 90 ms
-        + Orthodromic AVRT: QRS hẹp, không có sóng delta, sóng P đảo đi sau QRS, RP > PR và/hoặc RP > 90 ms
-        + Antidromic AVRT: QRS rộng, có sóng delta, P đảo sau QRS
-        + Nhịp nhanh bộ nối (JET): QRS hẹp, P đảo trước QRS (PR < 0.12s) hoặc sau QRS (RP <= 0.20s)
-        + SVT dẫn truyền lệch hướng: QRS rộng (0.12-0.16s), dạng RBBB với tai thỏ phải cao hơn ở V1
-    - Nhịp nhanh thất (VT) & Rối loạn nhịp thất ác tính (Chương 13):
-        + Dấu hiệu Brugada (khởi đầu R đến đáy S > 100 ms), Dấu hiệu Josephson (khắc sườn xuống đáy S ở V1/V2)
-        + QRS > 160 ms, Trục vô định, Đồng hướng dương/âm ở V1-V6, Tai thỏ trái lớn hơn ở V1 (R > R')
-        + Xoắn đỉnh (Torsades de pointes): QRS xoắn quanh đường đẳng điện trên nền QT kéo dài, HR 200-250 l/p
-        + Rung thất: Sóng hỗn loạn vô tổ chức, HR 150-500 l/p
-        + Cuồng thất: Sóng hình sin liên tục, HR 150-300 l/p
-        + Định vị ổ VT: RVOT (dạng LBBB ở V1, DII/III/aVF dương), LVOT (dạng RBBB ở V1, DII/III/aVF dương), Bó nhánh trái sau (RBBB + trục lệch trái)
+    Quy tắc CAPS SCAN và Bảng 2.1, 2.2 trong Sổ tay ĐTĐ YDS 2026:
+    - Nhận diện nhiễu giả VT/VF:
+        + Dấu hiệu Notch (Notch sign): Các phức bộ QRS hẹp diễu hành xuyên qua dao động hỗn loạn.
+        + Dấu hiệu Sinus (Sinus sign): Ít nhất một chuyển đạo chi sạch nhịp xoang trong khi các chuyển đạo khác nhiễu như VF.
+    - Sai lệch điện cực chi:
+        + LA/RA: DI đảo ngược hoàn toàn (P, QRS, T âm), aVR dương tính, V1-V6 bình thường (phổ biến nhất).
+        + LA/LL: Sóng P ở DI > P ở DII, P ở DIII đảo ngược.
+        + RA/LL: Giả nhồi máu thành dưới với P âm, trục lệch cực đoan.
+        + RA/RL hoặc LA/RL: DII hoặc DIII là đường thẳng đẳng điện.
+    - Sai lệch điện cực trước tim:
+        + Đặt V1-V2 quá cao (KLS 2-3): Sóng P ở V2 bị âm hoặc hai pha (bình thường P ở V2 luôn dương).
+        + Đảo ngược thứ tự V1-V6: Phá vỡ sự tiến triển bình thường của sóng R (biên độ R không tăng dần từ V1 đến V5).
     """
-    leads = data["leads"]
-    hr = data["hr"]
-    qrs = data["qrs"]
-    pr = data["pr"]
-    rr_cv = data["rr_cv"]
-    mean_rr = data["mean_rr"]
-    p_ratio = data["p_ratio"]
-
     findings = []
     alerts = []
 
-    # ---------------- A. NHÓM RỐI LOẠN NHỊP THẤT ÁC TÍNH (VF / VT / CUỒNG THẤT / XOẮN ĐỈNH) ----------------
-    # Rung thất (VF): Sóng hỗn loạn vô tổ chức, không xác định được P-QRS-T
-    if hr >= 220 and rr_cv > 0.30 and qrs >= 0.16:
-        findings.append(("Rối loạn nhịp thất ác tính", "Rung thất (Ventricular Fibrillation - VF): Hoạt động điện thất hỗn loạn, vô tổ chức, mất hoàn toàn phức bộ QRS"))
-        alerts.append("🚨 BÁO ĐỘNG ĐỎ: RUNG THẤT - BỆNH NHÂN NGƯNG TIM, KÍCH HOẠT HỒI SỨC TIM PHỔI & SỐC ĐIỆN PHÁ RUNG NGAY LẬP TỨC")
-        return {"findings": findings, "alerts": alerts}
+    d1 = leads.get("I", {})
+    d2 = leads.get("II", {})
+    d3 = leads.get("III", {})
+    avr = leads.get("aVR", {})
+    v1 = leads.get("V1", {})
+    v2 = leads.get("V2", {})
 
-    # Cuồng thất: Sóng hình sin liên tục, tần số 150-300 l/p
-    if 180 <= hr <= 300 and qrs >= 0.16 and rr_cv < 0.08:
-        findings.append(("Rối loạn nhịp thất ác tính", "Cuồng thất (Ventricular Flutter): Các sóng hình sin đều đặn liên tục, tần số 150-300 lần/phút"))
-        alerts.append("🚨 CẤP CỨU NGUY KỊCH: CUỒNG THẤT - NGUY CƠ TIẾN TRIỂN THÀNH RUNG THẤT, CẦN SỐC ĐIỆN PHÁ RUNG KHẨN CẤP")
-        return {"findings": findings, "alerts": alerts}
+    # 1. Kiểm tra Dấu hiệu Notch & Sinus chống chẩn đoán nhầm VT/VF
+    limb_signals_clean = [leads.get(ld, {}).get("p_detected", False) for ld in ["I", "II", "III"]]
+    has_notch = any(l.get("has_notch_sign", False) for l in leads.values())
+    if any(limb_signals_clean) and has_notch:
+        findings.append(("Kiểm tra kỹ thuật", "Dấu hiệu Notch / Sinus dương tính: Phát hiện phức bộ QRS hẹp diễu hành xuyên qua nhiễu dao động (Nhiễu do run cơ Parkinson hoặc chuyển động, không phải rung thất/nhanh thất)"))
 
-    # Xoắn đỉnh: Trên nền QT kéo dài, QRS đa dạng xoắn quanh đường đẳng điện
-    v1_to_v6_amps = [leads.get(f"V{i}", {}).get("r_amp", 0.0) for i in range(1, 7)]
-    if hr >= 150 and max(v1_to_v6_amps) - min(v1_to_v6_amps) > 12.0 and rr_cv > 0.20:
-        findings.append(("Rối loạn nhịp thất ác tính", "Xoắn đỉnh (Torsades de Pointes): Nhịp nhanh thất đa dạng với phức bộ QRS xoắn vặn quanh đường đẳng điện (thường xuất hiện trên nền QTc kéo dài)"))
-        alerts.append("🚨 CẤP CỨU: XOẮN ĐỈNH - TRUYỀN MAGNESIUM SULFATE VÀ CHUẨN BỊ SỐC ĐIỆN ĐỒNG BỘ NẾU RỐI LOẠN HUYẾT ĐỘNG")
-        return {"findings": findings, "alerts": alerts}
+    # 2. Kiểm tra Sai lệch điện cực chi (Bảng 2.2)
+    # A. Đảo ngược LA/RA (Tay phải - Tay trái)
+    d1_all_neg = (d1.get("r_amp", 0.0) < d1.get("s_amp", 0.0)) and (d1.get("t_amp", 0.0) < 0) and (d1.get("p_amp", 0.0) < 0 or not d1.get("p_detected", True))
+    avr_pos = (avr.get("r_amp", 0.0) > avr.get("s_amp", 0.0)) and (avr.get("t_amp", 0.0) > 0)
+    if d1_all_neg and avr_pos:
+        findings.append(("Sai lệch điện cực", "Nghi ngờ Đảo ngược điện cực tay phải - tay trái (LA/RA): DI đảo ngược hoàn toàn (P, QRS, T âm), aVR dương tính (Cần phân biệt với Đảo ngược phủ tạng)"))
+        alerts.append("⚠️ CẢNH BÁO KỸ THUẬT: ĐẢO DÂY ĐIỆN CỰC TAY LA/RA - ĐỀ NGHỊ ĐO LẠI ECG TRƯỚC KHI ĐỌC KẾT QUẢ")
 
-    # ---------------- B. NHỊP NHANH THẤT (VENTRICULAR TACHYCARDIA - VT) ----------------
-    if hr > 100 and qrs >= 0.12:
-        # Tiêu chuẩn gợi ý mạnh VT theo Bảng 13.1 và Lưu đồ Brugada / Vereckei
-        vt_criteria_met = []
-        d1 = leads.get("I", {})
-        avf = leads.get("aVF", {})
-        v1 = leads.get("V1", {})
-        d2 = leads.get("II", {})
+    # B. Đảo ngược LA/LL (Tay trái - Chân trái)
+    if d1.get("p_amp", 0.0) > d2.get("p_amp", 0.0) and d3.get("t_amp", 0.0) < -0.5 and (d3.get("p_amp", 0.0) < 0):
+        findings.append(("Sai lệch điện cực", "Gợi ý Đảo ngược điện cực tay trái - chân trái (LA/LL): Sóng P ở DI > P ở DII, P và T ở DIII đảo ngược (Nguy cơ chẩn đoán nhầm nhồi máu cơ tim thành dưới)"))
 
-        # 1. Trục QRS vô định (DI âm, aVF âm: +180° đến +270°)
-        net_d1 = d1.get("r_amp", 0.0) - d1.get("s_amp", 0.0)
-        net_avf = avf.get("r_amp", 0.0) - avf.get("s_amp", 0.0)
-        if net_d1 < 0 and net_avf < 0:
-            vt_criteria_met.append("Trục QRS vô định (DI âm, aVF âm)")
+    # C. Đảo ngược RA/RL hoặc LA/RL (Dây đất)
+    if d2.get("is_flatline", False):
+        findings.append(("Sai lệch điện cực", "Lỗi đảo ngược điện cực RA/RL: Chuyển đạo DII là một đường thẳng đẳng điện (D1 và D3 đối xứng nhau)"))
+        alerts.append("⚠️ LỖI KỸ THUẬT: CHUYỂN ĐẠO DII ĐẲNG ĐIỆN DO ĐẢO DÂY ĐẤT RA/RL")
+    elif d3.get("is_flatline", False):
+        findings.append(("Sai lệch điện cực", "Lỗi đảo ngược điện cực LA/RL: Chuyển đạo DIII là một đường thẳng đẳng điện (D1 và D2 giống hệt nhau)"))
+        alerts.append("⚠️ LỖI KỸ THUẬT: CHUYỂN ĐẠO DIII ĐẲNG ĐIỆN DO ĐẢO DÂY ĐẤT LA/RL")
 
-        # 2. QRS rất rộng > 160 ms
-        if qrs > 0.16:
-            vt_criteria_met.append(f"QRS rất rộng ({qrs*1000:.0f} ms > 160 ms)")
+    # 3. Kiểm tra Sai lệch điện cực trước tim
+    # Đặt V1-V2 quá cao (KLS 2 hoặc 3): sóng P ở V2 bị âm hoặc hai pha (bình thường P ở V2 luôn dương)
+    if v2.get("p_amp", 0.0) < 0 or v2.get("t_morph") in ["biphasic_pos_neg", "biphasic_neg_pos"] and (v2.get("r_amp", 0.0) < 3.0):
+        findings.append(("Sai lệch điện cực", "Gợi ý Đặt điện cực V1-V2 quá cao (KLS 2 hoặc 3): Sóng P ở V2 âm hoặc hai pha (Dễ gây hình ảnh giả sóng Q hoại tử vách, giả RBBB hoặc giả Brugada)"))
 
-        # 3. Đồng hướng dương hoặc đồng hướng âm ở V1-V6
-        chest_signs = [(leads.get(f"V{i}", {}).get("r_amp", 0.0) - leads.get(f"V{i}", {}).get("s_amp", 0.0)) for i in range(1, 7)]
-        if all(s > 0 for s in chest_signs):
-            vt_criteria_met.append("QRS đồng hướng dương ở tất cả các chuyển đạo trước ngực V1-V6")
-        elif all(s < 0 for s in chest_signs):
-            vt_criteria_met.append("QRS đồng hướng âm ở tất cả các chuyển đạo trước ngực V1-V6 (Rất đặc hiệu cho VT)")
-
-        # 4. Dấu hiệu tai thỏ trái lớn hơn ở V1 (R > R')
-        if v1.get("left_rabbit_ear", False):
-            vt_criteria_met.append("Dấu hiệu tai thỏ với tai trái lớn hơn ở V1 (R > R')")
-
-        # 5. Dấu hiệu Brugada: thời gian bắt đầu R đến đáy S > 100 ms
-        max_rs_time = max(l.get("r_to_s_time", 0.0) for l in leads.values())
-        if max_rs_time > 0.10:
-            vt_criteria_met.append(f"Dấu hiệu Brugada dương tính (Thời gian R đến đáy S = {max_rs_time*1000:.0f} ms > 100 ms)")
-
-        # 6. Dấu hiệu Josephson: có khấc ở sườn xuống đáy sóng S tại V1/V2
-        if v1.get("has_josephson", False) or leads.get("V2", {}).get("has_josephson", False):
-            vt_criteria_met.append("Dấu hiệu Josephson dương tính (Khấc sườn xuống đáy sóng S tại V1/V2)")
-
-        # 7. Sóng R đơn pha đầu tiên ở aVR (Lưu đồ Vereckei)
-        if leads.get("aVR", {}).get("r_amp", 0.0) > 4.0 and leads.get("aVR", {}).get("q_amp", 0.0) == 0:
-            vt_criteria_met.append("Sóng R đầu tiên ở aVR hiện diện (Lưu đồ Vereckei)")
-
-        # Nếu có từ 2 tiêu chuẩn hoặc có dấu hiệu đặc hiệu -> Khẳng định VT
-        if len(vt_criteria_met) >= 2 or (qrs > 0.16 and len(vt_criteria_met) >= 1):
-            # Định vị ổ khởi phát VT (Chương 13 mục 3)
-            vt_loc = "Đơn dạng không đặc hiệu"
-            net_d2 = d2.get("r_amp", 0.0) - d2.get("s_amp", 0.0)
-            if net_d2 > 0 and net_avf > 0:
-                if v1.get("r_amp", 0.0) < v1.get("s_amp", 0.0):
-                    vt_loc = "Buồng tống thất phải (RVOT: V1 dạng LBBB, DII/DIII/aVF dương)"
-                else:
-                    vt_loc = "Buồng tống thất trái (LVOT: V1 dạng RBBB, DII/DIII/aVF dương)"
-            elif v1.get("true_rsr", False) or (v1.get("r_amp", 0.0) > v1.get("s_amp", 0.0)):
-                if net_d1 > 0 and net_avf < 0:
-                    vt_loc = "Bó nhánh trái sau (Dạng RBBB + Trục lệch trái)"
-                elif net_d1 < 0 and net_avf > 0:
-                    vt_loc = "Bó nhánh trái trước (Dạng RBBB + Trục lệch phải)"
-
-            findings.append(("Nhịp nhanh thất (VT)", f"Nhịp nhanh thất (Ventricular Tachycardia - VT): {'; '.join(vt_criteria_met)} - Vị trí khởi phát dự đoán: {vt_loc}"))
-            alerts.append("🚨 CẤP CỨU: NHỊP NHANH THẤT (VT) - ĐÁNH GIÁ NGAY HUYẾT ĐỘNG: NẾU HUYẾT ĐỘNG KHÔNG ỔN ĐỊNH CẦN SỐC ĐIỆN ĐỒNG BỘ NGAY")
-            return {"findings": findings, "alerts": alerts}
-
-    # ---------------- C. NHỊP NHANH TRÊN THẤT PHỨC BỘ RỘNG DẪN TRUYỀN LỆCH HƯỚNG / ANTIDROMIC AVRT ----------------
-    if hr > 100 and qrs >= 0.12:
-        v1 = leads.get("V1", {})
-        if v1.get("true_rsr", False) and not v1.get("left_rabbit_ear", False):
-            findings.append(("Nhịp nhanh trên thất", "Nhịp nhanh trên thất dẫn truyền lệch hướng (SVT with Aberrancy): QRS giãn rộng có dạng RBBB với tai thỏ bên phải cao hơn (R' > R) ở V1"))
-            alerts.append("⚠️ SVT DẪN TRUYỀN LỆCH HƯỚNG: CẦN PHÂN BIỆT THẬN TRỌNG VỚI NHANH THẤT (MẶC ĐỊNH XỬ TRÍ NHƯ NHANH THẤT NẾU CHƯA RÕ CHẨN ĐOÁN)")
-            return {"findings": findings, "alerts": alerts}
-        elif any(l.get("has_delta", False) for l in leads.values()):
-            findings.append(("Nhịp nhanh trên thất", "Nhịp nhanh vào lại nhĩ thất dẫn truyền ngược dòng (Antidromic AVRT): QRS giãn rộng có sóng Delta ở phần đầu"))
-            alerts.append("⚠️ ANTIDROMIC AVRT: XUNG ĐỘNG DẪN QUA ĐƯỜNG PHỤ - CHỐNG CHỈ ĐỊNH DÙNG THUỐC CHẸN NÚT NHĨ THẤT")
-            return {"findings": findings, "alerts": alerts}
-
-    # ---------------- D. TIẾP CẬN CHẨN ĐOÁN NHỊP NHANH PHỨC BỘ HẸP (QRS <= 0.12s) ----------------
-    if hr > 100 and qrs < 0.12:
-        # 1. Rung nhĩ đáp ứng thất nhanh
-        if rr_cv > 0.20 and p_ratio < 0.20:
-            findings.append(("Rối loạn nhịp nhĩ", f"Rung nhĩ đáp ứng thất nhanh (AFib with RVR) - Tần số: {hr} lần/phút: Mất sóng P, nhịp hoàn toàn không đều"))
-            alerts.append("⚠️ RUNG NHĨ ĐÁP ỨNG THẤT NHANH: CẦN KIỂM SOÁT TẦN SỐ THẤT VÀ ĐÁNH GIÁ NGUY CƠ HUYẾT KHỐI")
-            return {"findings": findings, "alerts": alerts}
-
-        # 2. Cuồng nhĩ (Atrial Flutter)
-        if 135 <= hr <= 165 and any(abs(l.get("st_shift", 0.0)) > 0 for l in leads.values()):
-            # Thường gặp cuồng nhĩ dẫn truyền 2:1 với tần số nhĩ ~300 l/p, tần số thất ~150 l/p
-            findings.append(("Rối loạn nhịp nhĩ", f"Cuồng nhĩ (Atrial Flutter): Nghi ngờ cuồng nhĩ dẫn truyền 2:1 (tần số thất {hr} l/p đều) - Đề nghị làm nghiệm pháp xoa xoang cảnh hoặc tiêm Adenosine để bộc lộ sóng F"))
-            alerts.append("⚠️ CUỒNG NHĨ: SÓNG F RĂNG CƯA 2:1 CÓ THỂ BỊ CHE KHUẤT TRONG PHỨC BỘ QRS")
-            return {"findings": findings, "alerts": alerts}
-
-        # 3. Nhịp nhanh nhĩ đa ổ (MAT)
-        if rr_cv > 0.15 and p_ratio >= 0.50:
-            findings.append(("Rối loạn nhịp nhĩ", f"Nhịp nhanh nhĩ đa ổ (MAT - Multifocal Atrial Tachycardia) - Tần số: {hr} l/p: Nhịp không đều với các khoảng PP, PR thay đổi (thường gặp ở bệnh nhân COPD)"))
-            return {"findings": findings, "alerts": alerts}
-
-        # 4. Khảo sát nhóm AVNRT vs AVRT vs Nhịp nhanh nhĩ đơn ổ dựa theo khoảng RP (Sơ đồ 12.1 trang 123)
-        rp_val = max(l.get("rp_interval", 0.0) for l in leads.values())
-        pseudo_r = leads.get("V1", {}).get("pseudo_r_prime", False)
-        p_inv = any(leads.get(ld, {}).get("p_inverted", False) for ld in ["II", "III", "aVF"])
-
-        if pseudo_r or (0 < rp_val <= 0.09):
-            findings.append(("Nhịp nhanh vào lại nút nhĩ thất (AVNRT)", f"AVNRT thể điển hình (Chậm - Nhanh / Slow-Fast): Nhịp nhanh đều ({hr} l/p), QRS hẹp, khoảng RP rất ngắn (RP = {rp_val*1000:.0f} ms ≤ 90 ms), thấy sóng r' giả ở V1 hoặc s giả ở DII"))
-        elif rp_val > 0.09 and rp_val < pr:
-            findings.append(("Nhịp nhanh vào lại nhĩ thất (AVRT)", f"Orthodromic AVRT (Dẫn truyền xuôi dòng qua nút nhĩ thất): Nhịp nhanh đều ({hr} l/p), QRS hẹp, sóng P đảo ngược đi sau QRS, khoảng RP dài (RP = {rp_val*1000:.0f} ms > 90 ms)"))
-        elif p_inv and pr < 0.12:
-            findings.append(("Nhịp nhanh bộ nối (JET)", f"Nhịp nhanh bộ nối (Junctional Ectopic Tachycardia - JET) - Tần số: {hr} l/p: QRS hẹp, sóng P đảo đi trước với PR < 0.12s hoặc đi sau QRS"))
-        else:
-            findings.append(("Nhịp nhanh trên thất", f"Nhịp nhanh kịch phát trên thất (SVT) / Nhịp nhanh nhĩ đơn ổ - Tần số: {hr} lần/phút"))
+    # Đảo ngược thứ tự V1-V6: phá vỡ sự tiến triển bình thường của sóng R
+    v_r_amps = [leads.get(f"V{i}", {}).get("r_amp", 0.0) for i in range(1, 7)]
+    if len(v_r_amps) == 6:
+        if v_r_amps[1] > 12.0 and v_r_amps[2] < 4.0 and v_r_amps[3] > 8.0:
+            findings.append(("Sai lệch điện cực", "Nghi ngờ Đảo lộn thứ tự dây trước tim V2 và V3: Sóng R ở V2 cao vọt bất thường rồi V3 tụt giảm đột ngột"))
 
     return {"findings": findings, "alerts": alerts}
 
 # =========================================================================
-# 4. BỘ ĐÁNH GIÁ CHẨN ĐOÁN TỔNG HỢP TOÀN DIỆN
+# 4. CHẨN ĐOÁN LỚN NHĨ & DÀY THẤT (YDS 2026 CHƯƠNG 3)
 # =========================================================================
-def evaluate_yds_coronary_syndromes(leads, gender="Nam", age=55):
-    st_elevation_leads = []
-    st_depression_leads = []
-    hyperacute_t_leads = []
-    inverted_t_leads = []
-    flat_t_leads = []
-    biphasic_t_leads = []
-    pathological_q_leads = []
-
-    for l_name, l_data in leads.items():
-        if l_name == "aVR":
-            continue
-
-        st_val = l_data.get("st_shift", 0.0)
-        t_val = l_data.get("t_amp", 0.0)
-        t_morph = l_data.get("t_morph", "normal")
-        r_val = l_data.get("r_amp", 0.0)
-        s_val = l_data.get("s_amp", 0.0)
-        q_dur = l_data.get("q_dur", 0.0)
-        q_amp = l_data.get("q_amp", 0.0)
-        slope = l_data.get("st_slope", "flat")
-
-        if l_name in ["V2", "V3"]:
-            cutoff = 1.5 if gender == "Nữ" else (2.0 if age >= 40 else 2.5)
-        else:
-            cutoff = 1.0
-
-        if st_val >= cutoff:
-            st_elevation_leads.append(l_name)
-
-        if st_val <= -0.5:
-            st_depression_leads.append((l_name, slope))
-
-        is_chest = l_name.startswith("V")
-        if (is_chest and t_val > 10.0) or (not is_chest and t_val > 5.0) or (r_val > 0 and t_val > 0.75 * r_val):
-            hyperacute_t_leads.append(l_name)
-
-        if t_val < -1.0 and (r_val > s_val or r_val > 5.0):
-            inverted_t_leads.append(l_name)
-
-        if -1.0 <= t_val <= 1.0 and r_val > 3.0:
-            flat_t_leads.append(l_name)
-
-        if t_morph == "biphasic_pos_neg":
-            biphasic_t_leads.append(l_name)
-
-        if l_name in ["V2", "V3"]:
-            if q_dur > 0.020 or (r_val == 0.0 and q_amp >= 2.0):
-                pathological_q_leads.append(l_name)
-        else:
-            if (q_dur >= 0.038 and q_amp >= 1.0) or (r_val == 0.0 and q_amp >= 2.0):
-                pathological_q_leads.append(l_name)
-
+def evaluate_atrial_ventricular_hypertrophy_yds(leads, gender="Nam"):
+    """
+    Tiêu chuẩn chuẩn hóa trích từ Sổ tay ĐTĐ YDS 2026:
+    - Lớn nhĩ:
+        + Lớn nhĩ trái: DII có sóng P dạng 2 đỉnh (lưng lạc đà), P > 0.11s, khoảng cách 2 đỉnh > 0.04s. V1 sóng P hai pha với pha âm sâu > 1mm, rộng > 0.04s.
+        + Lớn nhĩ phải: DII/DIII/aVF có P cao >= 2.5 mm ("P phế" trục lệch phải, "P bẩm sinh" trục lệch trái). V1/V2 có pha dương của P > 1.5 mm.
+        + Lớn hai nhĩ: DII sóng P rộng >= 0.12s VÀ cao >= 2.5 mm. V1 pha dương cao > 1.5 mm VÀ pha âm rộng > 0.04s, sâu > 1 mm.
+    - Dày thất trái (LVH):
+        + Chuyển đạo chi: R(DI) + S(DIII) > 25 mm, R(aVL) > 11 mm, R(aVF) > 20 mm, S(aVR) > 14 mm.
+        + Chuyển đạo trước ngực: R(V4-V6) > 26 mm, Sokolow-Lyon (SV1 + RV5/6 >= 35 mm), R max + S max > 45 mm.
+        + Cornell: R(aVL) + S(V3) > 28 mm (Nam) hoặc > 20 mm (Nữ).
+        + VAT ở V5/V6 > 0.05s (50 ms).
+        + Tăng gánh thất trái (ST chênh xuống và T âm ở DI, aVL, V5, V6).
+        + Tiêu chuẩn Romhilt-Estes (>= 5 điểm là dày thất trái chắc chắn, 4 điểm là có thể).
+    - Dày thất phải (RVH):
+        + Trục lệch phải >= 110°.
+        + R ưu thế ở V1 (>= 7 mm hoặc R/S > 1).
+        + S ưu thế ở V5/V6 (>= 7 mm hoặc R/S < 1).
+        + Sokolow-Lyon phải: RV1 + SV5/SV6 >= 11 mm.
+        + Tăng gánh thất phải (ST chênh xuống và T âm ở V1-V4 và DII, DIII, aVF).
+        + Dấu hiệu S1 S2 S3: S ưu thế ở DI, DII, DIII.
+        + VAT ở V1/V2 > 0.035s.
+    - Dày hai thất:
+        + Dày thất trái kèm dấu hiệu gợi ý dày thất phải (lớn nhĩ phải, trục lệch phải, sóng S sâu ở V5-V6).
+        + Tiêu chuẩn Katz-Wachtel: QRS lớn hai pha (R cao + S sâu) ở V2-V5 với tổng R + S > 50 mm.
+    """
     findings = []
     alerts = []
-    st_set = set(st_elevation_leads)
-    dep_leads_names = [item[0] for item in st_depression_leads]
-    dep_set = set(dep_leads_names)
 
-    # Biến thể tương đương
-    avr_st = leads.get("aVR", {}).get("st_shift", 0.0)
-    dewinter_candidates = [l for (l, sl) in st_depression_leads if l.startswith("V") and sl == "upsloping" and l in hyperacute_t_leads]
-    if len(dewinter_candidates) >= 2 or (avr_st >= 0.5 and len([l for (l, sl) in st_depression_leads if l.startswith("V") and sl == "upsloping"]) >= 2):
-        findings.append(("Hội chứng mạch vành cấp", "Hội chứng De Winter: Điểm J chênh xuống đi lên ở V1-V6 kèm sóng T cao đối xứng (Tương đương STEMI tắc đoạn gần LAD)"))
-        alerts.append("🚨 CẤP CỨU: HỘI CHỨNG DE WINTER - CAN THIỆP MẠCH VÀNH KHẨN CẤP")
+    d1 = leads.get("I", {})
+    d2 = leads.get("II", {})
+    d3 = leads.get("III", {})
+    avf = leads.get("aVF", {})
+    avl = leads.get("aVL", {})
+    avr = leads.get("aVR", {})
+    v1 = leads.get("V1", {})
+    v2 = leads.get("V2", {})
+    v3 = leads.get("V3", {})
+    v4 = leads.get("V4", {})
+    v5 = leads.get("V5", {})
+    v6 = leads.get("V6", {})
 
-    wellens_a = [l for l in biphasic_t_leads if l in ["V1", "V2", "V3"]]
-    wellens_b = [l for l in inverted_t_leads if l in ["V1", "V2", "V3", "V4"]]
-    if len(wellens_a) >= 2:
-        findings.append(("Hội chứng mạch vành cấp", f"Hội chứng Wellens Type A: Sóng T hai pha (+/-) tại {', '.join(wellens_a)} (Gợi ý hẹp nặng đoạn gần LAD)"))
-        alerts.append("⚠️ HỘI CHỨNG WELLENS TYPE A: NGUY CƠ TIẾN TRIỂN THÀNH NMCT DIỆN RỘNG")
-    elif len(wellens_b) >= 2:
-        findings.append(("Hội chứng mạch vành cấp", f"Hội chứng Wellens Type B: Sóng T âm sâu đối xứng tại {', '.join(wellens_b)} (Gợi ý hẹp nặng đoạn gần LAD)"))
-        alerts.append("⚠️ HỘI CHỨNG WELLENS TYPE B: CHỈ ĐỊNH CHỤP MẠCH VÀNH SỚM")
+    # 1. KHẢO SÁT LỚN NHĨ (ATRIAL ENLARGEMENT)
+    p_amp_d2 = d2.get("p_amp", 0.0)
+    p_dur_d2 = d2.get("p_dur", 0.08)
+    p_notched_d2 = d2.get("p_notched", False)
+    p_peaks_dist_d2 = d2.get("p_peaks_dist", 0.0)
 
-    if len(dep_leads_names) >= 6 and avr_st >= 1.0:
-        findings.append(("Hội chứng mạch vành cấp", f"Gợi ý tổn thương Thân chung ĐM Vành Trái (LMCA) hoặc 3 nhánh: ST chênh xuống lan tỏa ({', '.join(dep_leads_names)}) kèm ST chênh lên tại aVR"))
-        alerts.append("🚨 NGUY KỊCH: THEO DÕI HẸP NẶNG THÂN CHUNG LMCA / 3 NHÁNH")
+    v1_pos_p = v1.get("p_pos_amp", 0.0)
+    v1_neg_p = v1.get("p_neg_amp", 0.0)
+    v1_neg_dur = v1.get("p_neg_dur", 0.0)
+    v2_pos_p = v2.get("p_pos_amp", 0.0)
 
-    # STEMI
-    stemi_regions = []
-    culprit_artery = []
-    if {"V1", "V2", "V3", "V4", "V5", "V6"}.issubset(st_set) or ({"V1", "V2", "V3", "V4"}.issubset(st_set) and {"I", "aVL"}.intersection(st_set)):
-        recip = " (Soi gương ở DII, DIII, aVF)" if len({"II", "III", "aVF"}.intersection(dep_set)) >= 1 else ""
-        stemi_regions.append(f"Thành trước rộng (Extensive Anterior: V1-V6, DI, aVL){recip}")
-        culprit_artery.append("Đoạn gần LAD (pLAD)")
-    elif {"V1", "V2", "V3", "V4"}.issubset(st_set):
-        stemi_regions.append("Thành trước vách (Anteroseptal: V1-V4)")
-        culprit_artery.append("LAD (trước S1/D1)")
-    elif len({"V2", "V3", "V4", "V5"}.intersection(st_set)) >= 3:
-        stemi_regions.append("Thành trước (Anterior: V2-V5)")
-        culprit_artery.append("LAD")
-    elif {"V1", "V2"}.issubset(st_set):
-        stemi_regions.append("Vách liên thất (Septal: V1-V2)")
-        culprit_artery.append("Nhánh vách của LAD")
-    elif {"V3", "V4"}.issubset(st_set):
-        stemi_regions.append("Thành trước (Anterior: V3-V4)")
-        culprit_artery.append("LAD đoạn giữa")
+    max_p_limb = max(p_amp_d2, d3.get("p_amp", 0.0), avf.get("p_amp", 0.0))
 
-    if {"I", "aVL"}.issubset(st_set) and not {"V5", "V6"}.intersection(st_set):
-        recip = " (Soi gương ở DII, DIII, aVF)" if len({"II", "III", "aVF"}.intersection(dep_set)) >= 1 else ""
-        stemi_regions.append(f"Thành bên cao đơn thuần (High Lateral: DI, aVL){recip}")
-        culprit_artery.append("Nhánh D1 của LAD hoặc LCx")
-    elif {"V5", "V6"}.issubset(st_set) and not {"I", "aVL"}.intersection(st_set):
-        stemi_regions.append("Thành bên thấp (Low Lateral: V5-V6)")
-        culprit_artery.append("Đoạn xa LAD (dLAD)")
-    elif {"V5", "V6", "I", "aVL"}.issubset(st_set):
-        stemi_regions.append("Thành bên toàn bộ (Lateral: V5, V6, DI, aVL)")
-        culprit_artery.append("LCx hoặc nhánh D1 của LAD")
+    is_rah = (max_p_limb >= 2.5) or (v1_pos_p > 1.5 or v2_pos_p > 1.5)
+    is_lah = (p_dur_d2 > 0.11 and (p_notched_d2 or p_peaks_dist_d2 > 0.04)) or (v1_neg_p > 1.0 and v1_neg_dur > 0.04)
 
-    inferior_leads = {"II", "III", "aVF"}.intersection(st_set)
-    if len(inferior_leads) >= 2:
-        recip = " (Soi gương ở aVL, DI, V1-V3)" if len({"aVL", "I", "V1", "V2"}.intersection(dep_set)) >= 1 else ""
-        stemi_regions.append(f"Thành dưới (Inferior: {', '.join(sorted(list(inferior_leads)))}){recip}")
-        culprit_artery.append("RCA (80%) hoặc LCx (20%)")
+    if is_rah and is_lah:
+        findings.append(("Lớn buồng tim", "Lớn hai nhĩ: Sóng P vừa cao ≥ 2.5 mm vừa rộng ≥ 0.12s ở DII; tại V1 pha dương cao > 1.5 mm và pha âm sâu > 1 mm, rộng > 0.04s"))
+    elif is_rah:
+        p_type = "P phế (P pulmonale)" if (d1.get("r_amp", 0.0) < avf.get("r_amp", 0.0)) else "P bẩm sinh (P congenitale)"
+        findings.append(("Lớn buồng tim", f"Lớn nhĩ phải ({p_type}): Sóng P cao {max_p_limb:.1f} mm (≥ 2.5 mm ở DII/DIII/aVF) hoặc pha dương sóng P ở V1/V2 > 1.5 mm"))
+    elif is_lah:
+        findings.append(("Lớn buồng tim", "Lớn nhĩ trái (P nhĩ / P mitrale): Sóng P ở DII có dạng 2 đỉnh (lưng lạc đà) rộng > 0.11s; tại V1 pha âm rộng > 0.04s và sâu > 1 mm (Chỉ số Morris)"))
 
-    v2_r = leads.get("V2", {}).get("r_amp", 0.0)
-    v2_s = leads.get("V2", {}).get("s_amp", 0.0)
-    v2_st = leads.get("V2", {}).get("st_shift", 0.0)
-    v2_t = leads.get("V2", {}).get("t_amp", 0.0)
-    if (v2_s > 0 and v2_r / v2_s > 1.0) and v2_st <= -0.5 and v2_t > 0:
-        stemi_regions.append("Dấu hiệu gián tiếp NMCT Thành sau thực (R/S > 1, ST chênh xuống, T dương ở V2-V3 - Đề nghị đo V7-V9)")
-        culprit_artery.append("RCA hoặc LCx")
+    # 2. KHẢO SÁT DÀY THẤT TRÁI (LVH)
+    # Tiêu chuẩn điện thế
+    r_d1 = d1.get("r_amp", 0.0)
+    s_d3 = d3.get("s_amp", 0.0)
+    r_avl = avl.get("r_amp", 0.0)
+    r_avf = avf.get("r_amp", 0.0)
+    s_avr = avr.get("s_amp", 0.0)
+    s_v1 = v1.get("s_amp", 0.0)
+    r_v5 = v5.get("r_amp", 0.0)
+    r_v6 = v6.get("r_amp", 0.0)
+    s_v3 = v3.get("s_amp", 0.0)
+    vat_v5 = v5.get("vat", 0.03)
 
-    if stemi_regions:
-        reg_txt = " + ".join(stemi_regions)
-        art_txt = f" - ĐM thủ phạm dự đoán: {', '.join(set(culprit_artery))}" if culprit_artery else ""
-        has_q = any(l in set(pathological_q_leads) for l in st_set)
-        stage_str = "Bán cấp / Hoại tử (Đã có sóng Q)" if has_q else "Tối cấp / Cấp tính"
-        findings.append(("Hội chứng mạch vành cấp (STEMI)", f"Nhồi máu cơ tim ST chênh lên - Vùng: {reg_txt} - Giai đoạn: {stage_str}{art_txt}"))
-        alerts.append(f"🚨 CẤP CỨU: STEMI VÙNG {reg_txt.upper()} - KÍCH HOẠT PCI KHẨN CẤP")
-    elif len(st_depression_leads) >= 2 or len(inverted_t_leads) >= 2 or len(hyperacute_t_leads) >= 2:
-        ischemia_details = []
-        spec_dep = [f"{l} (dạng {sl})" for (l, sl) in st_depression_leads if sl in ["horizontal", "downsloping"]]
-        if len(spec_dep) >= 2:
-            ischemia_details.append(f"ST chênh xuống đặc hiệu tại: {', '.join(spec_dep)}")
-        elif len(dep_leads_names) >= 2:
-            ischemia_details.append(f"ST chênh xuống tại: {', '.join(dep_leads_names)}")
+    sokolow_lv = s_v1 + max(r_v5, r_v6)
+    cornell_val = r_avl + s_v3
+    cornell_cutoff = 28.0 if gender == "Nam" else 20.0
 
-        if len(inverted_t_leads) >= 2:
-            ischemia_details.append(f"Sóng T âm sâu đảo ngược tại: {', '.join(inverted_t_leads)}")
-        if len(hyperacute_t_leads) >= 2:
-            ischemia_details.append(f"Sóng T tối cấp tại: {', '.join(hyperacute_t_leads)}")
+    lvh_voltage_met = []
+    if (r_d1 + s_d3) > 25.0:
+        lvh_voltage_met.append("R(DI) + S(DIII) > 25 mm")
+    if r_avl > 11.0:
+        lvh_voltage_met.append(f"RaVL = {r_avl:.1f} mm (> 11 mm)")
+    if r_avf > 20.0:
+        lvh_voltage_met.append(f"RaVF = {r_avf:.1f} mm (> 20 mm)")
+    if s_avr > 14.0:
+        lvh_voltage_met.append(f"SaVR = {s_avr:.1f} mm (> 14 mm)")
+    if sokolow_lv >= 35.0:
+        lvh_voltage_met.append(f"Sokolow-Lyon = {sokolow_lv:.1f} mm (≥ 35 mm)")
+    if cornell_val > cornell_cutoff:
+        lvh_voltage_met.append(f"Cornell = {cornell_val:.1f} mm (> {cornell_cutoff:.0f} mm ở {gender})")
+    if max(r_v5, r_v6, v4.get("r_amp", 0.0)) > 26.0:
+        lvh_voltage_met.append("R ở V4, V5 hoặc V6 > 26 mm")
 
-        findings.append(("Thiếu máu cục bộ cơ tim (NSTE-ACS)", f"Biến đổi thiếu máu cơ tim cấp: {'; '.join(ischemia_details)}"))
-        alerts.append("⚠️ CẢNH BÁO: THEO DÕI NSTE-ACS - ĐỊNH LƯỢNG TROPONIN HS")
-    elif len(pathological_q_leads) >= 2:
-        q_set = set(pathological_q_leads)
-        old_mi_regions = []
-        if len({"II", "III", "aVF"}.intersection(q_set)) >= 2:
-            old_mi_regions.append("Thành dưới")
-        if {"V1", "V2"}.issubset(q_set) or {"V2", "V3"}.issubset(q_set):
-            old_mi_regions.append("Trước - Vách")
-        if {"V4", "V5", "V6"}.intersection(q_set) and len({"V4", "V5", "V6"}.intersection(q_set)) >= 2:
-            old_mi_regions.append("Thành trước - bên")
-        if old_mi_regions:
-            findings.append(("Hội chứng mạch vành mạn (CCS)", f"Sẹo hoại tử / Nhồi máu cơ tim cũ (Old MI theo chuẩn ESC 2018) - Vùng: {', '.join(old_mi_regions)}"))
+    # Dấu tăng gánh thất trái (ST chênh xuống và T âm ở V5, V6, DI, aVL)
+    has_lvh_strain = (v5.get("st_shift", 0.0) <= -0.5 and v5.get("t_amp", 0.0) < 0) or (v6.get("st_shift", 0.0) <= -0.5 and v6.get("t_amp", 0.0) < 0)
 
-    return {"findings": findings, "alerts": alerts}
+    # Tính điểm Romhilt-Estes (Bảng 3.2 trang 28-29)
+    re_score = 0
+    if (r_avl >= 11.0 or r_avf >= 20.0 or max(r_v5, r_v6) >= 30.0 or max(v1.get("s_amp", 0.0), v2.get("s_amp", 0.0)) >= 30.0):
+        re_score += 3
+    if has_lvh_strain:
+        re_score += 3  # Không dùng digitalis
+    if is_lah:
+        re_score += 3
+    if (d1.get("r_amp", 0.0) > d1.get("s_amp", 0.0) and avf.get("r_amp", 0.0) < avf.get("s_amp", 0.0) and d2.get("r_amp", 0.0) < d2.get("s_amp", 0.0)):
+        re_score += 2  # Trục lệch trái >= -30°
+    if v5.get("qrs_w", 0.08) >= 0.09:
+        re_score += 1
+    if vat_v5 >= 0.05:
+        re_score += 1
 
+    is_lvh_confirmed = (len(lvh_voltage_met) >= 1) or (re_score >= 5)
+
+    # 3. KHẢO SÁT DÀY THẤT PHẢI (RVH)
+    r_v1 = v1.get("r_amp", 0.0)
+    s_v1 = v1.get("s_amp", 0.0)
+    s_v5 = v5.get("s_amp", 0.0)
+    s_v6 = v6.get("s_amp", 0.0)
+    sokolow_rv = r_v1 + max(s_v5, s_v6)
+    is_rad = (d1.get("r_amp", 0.0) < d1.get("s_amp", 0.0)) and (avf.get("r_amp", 0.0) > avf.get("s_amp", 0.0))
+
+    rvh_signs = []
+    if is_rad:
+        rvh_signs.append("Trục lệch phải ≥ 110°")
+    if r_v1 >= 7.0 or (s_v1 > 0 and r_v1 / s_v1 > 1.0):
+        rvh_signs.append(f"Sóng R ưu thế ở V1 (R={r_v1:.1f} mm, R/S > 1)")
+    if max(s_v5, s_v6) >= 7.0 or (r_v5 > 0 and r_v5 / max(s_v5, 0.1) < 1.0):
+        rvh_signs.append("Sóng S ưu thế ở V5/V6 (S ≥ 7 mm, R/S < 1)")
+    if sokolow_rv >= 11.0:
+        rvh_signs.append(f"Sokolow-Lyon phải = {sokolow_rv:.1f} mm (≥ 11 mm)")
+    # Dấu hiệu S1 S2 S3
+    if d1.get("s_amp", 0.0) > d1.get("r_amp", 0.0) and d2.get("s_amp", 0.0) > d2.get("r_amp", 0.0) and d3.get("s_amp", 0.0) > d3.get("r_amp", 0.0):
+        rvh_signs.append("Dấu hiệu S1-S2-S3 hiện diện")
+
+    is_rvh_confirmed = (len(rvh_signs) >= 2) and (r_v1 >= 6.0 or is_rad)
+
+    # 4. KHẢO SÁT DÀY HAI THẤT (BIMODAL / TIÊU CHUẨN KATZ-WACHTEL)
+    # Tiêu chuẩn Katz-Wachtel: QRS lớn hai pha (R cao + S sâu) ở V2-V5 với tổng R + S > 50 mm
+    katz_wachtel_val = max([(leads.get(f"V{i}", {}).get("r_amp", 0.0) + leads.get(f"V{i}", {}).get("s_amp", 0.0)) for i in range(2, 6)])
+    has_katz_wachtel = katz_wachtel_val > 50.0
+
+    if has_katz_wachtel:
+        findings.append(("Phì đại buồng tim", f"Dày hai thất theo tiêu chuẩn Katz-Wachtel: Phức bộ QRS lớn hai pha ở V2-V5 với tổng R + S = {katz_wachtel_val:.1f} mm (> 50 mm, thường gặp trong tim bẩm sinh)"))
+    elif is_lvh_confirmed and (is_rah or is_rad or max(s_v5, s_v6) >= 7.0):
+        findings.append(("Phì đại buồng tim", f"Dày hai thất: Thỏa tiêu chuẩn dày thất trái kèm dấu hiệu gợi ý dày thất phải (Trục lệch phải hoặc S sâu ở V5/V6 hoặc Lớn nhĩ phải)"))
+    elif is_rvh_confirmed and (is_lah or sokolow_lv >= 35.0):
+        findings.append(("Phì đại buồng tim", "Dày hai thất: Thỏa tiêu chuẩn dày thất phải kèm dấu hiệu gợi ý dày thất trái (Lớn nhĩ trái hoặc Sokolow-Lyon trái ≥ 35 mm)"))
+    elif is_lvh_confirmed:
+        strain_txt = " kèm kiểu hình tăng gánh tâm thu thất trái (ST chênh xuống và T âm ở DI, aVL, V5, V6)" if has_lvh_strain else ""
+        findings.append(("Phì đại buồng tim", f"Dày thất trái (LVH): Thỏa {', '.join(lvh_voltage_met[:2])}; Điểm Romhilt-Estes = {re_score} điểm{strain_txt}"))
+    elif is_rvh_confirmed:
+        findings.append(("Phì đại buồng tim", f"Dày thất phải (RVH): {'; '.join(rvh_signs[:2])}"))
+
+    return {
+        "findings": findings,
+        "alerts": alerts,
+        "sokolow_lv": sokolow_lv,
+        "sokolow_rv": sokolow_rv,
+        "cornell": cornell_val,
+        "re_score": re_score
+    }
+
+# =========================================================================
+# 5. CÁC MODULE NHỊP NHANH & DẪN TRUYỀN ĐÃ XÂY DỰNG TRƯỚC ĐÓ
+# =========================================================================
 def evaluate_conduction_and_bradycardia_yds(data):
     leads = data["leads"]
     hr = data["hr"]
@@ -728,20 +682,6 @@ def evaluate_conduction_and_bradycardia_yds(data):
     if av_diag:
         findings.append(("Block Nhĩ Thất", av_diag))
 
-    # Block xoang nhĩ & Ngưng xoang
-    if len(long_rrs) > 0 and not av_diag:
-        is_multiple_pp = any(abs((r / mean_rr) - round(r / mean_rr)) < 0.10 for r in long_rrs)
-        max_pause = max(long_rrs)
-        if max_pause >= 3.0:
-            findings.append(("Hội chứng suy nút xoang", f"Khoảng ngưng xoang kéo dài > 3 giây (Pause = {max_pause:.2f}s)"))
-            alerts.append("🚨 CẢNH BÁO: NGƯNG XOANG > 3 GIÂY - CHỈ ĐỊNH TẠO NHỊP")
-        elif is_multiple_pp:
-            findings.append(("Block Xoang Nhĩ", f"Block xoang nhĩ độ II type 2: Khoảng PP cố định, có khoảng nghỉ đột ngột bằng bội số nguyên của PP (Khoảng nghỉ = {round(max_pause/mean_rr)} x PP)"))
-        elif max_pause < 2.0 * mean_rr:
-            findings.append(("Block Xoang Nhĩ", "Block xoang nhĩ độ II type 1: Khoảng PP và RR ngắn dần cho đến khi có khoảng nghỉ mất hẳn sóng P (< 2 x PP)"))
-        else:
-            findings.append(("Rối loạn chức năng nút xoang", f"Khoảng ngưng xoang (Sinus Pause = {max_pause:.2f}s): Khoảng ngưng không bằng bội số của PP cơ bản"))
-
     # Block dẫn truyền nội thất
     v1 = leads.get("V1", {})
     v5 = leads.get("V5", {})
@@ -767,7 +707,7 @@ def evaluate_conduction_and_bradycardia_yds(data):
     if v5_v6_notched_r and v1_qs_rs and no_q_lateral and not v1_has_m_pattern:
         if qrs >= 0.12:
             lbbb_type = "Block nhánh trái hoàn toàn (Complete LBBB): QRS ≥ 0.12s, V5-V6/DI/aVL sóng R đơn pha có móc (dạng chữ M) không có sóng Q, V1 dạng QS/rS"
-            alerts.append("🚨 LBBB HOÀN TOÀN: CẦN ĐỐI CHIẾU TIÊU CHUẨN SGARBOSSA LOẠI TRỪ NMCT THÀNH TRƯỚC")
+            alerts.append("🚨 LBBB HOÀN TOÀN: CẦN LOẠI TRỪ NMCT THÀNH TRƯỚC THEO TIÊU CHUẨN SGARBOSSA")
         else:
             lbbb_type = "Block nhánh trái không hoàn toàn (Incomplete LBBB): QRS < 0.12s"
 
@@ -793,19 +733,6 @@ def evaluate_conduction_and_bradycardia_yds(data):
             lpfb = True
             findings.append(("Block Phân Nhánh", "Block phân nhánh trái sau (LPFB): Trục lệch quá phải (≥ 120°); DI, aVL dạng rS; DII, DIII, aVF dạng qR"))
 
-    if rbbb_type and "Complete" in rbbb_type:
-        if lafb:
-            if av_diag and "độ I" in av_diag:
-                findings.append(("Block Ba Nhánh", "Block ba nhánh (Trifascicular Block): Block nhánh phải + Block phân nhánh trái trước + Block nhĩ thất độ 1"))
-                alerts.append("⚠️ CẢNH BÁO: BLOCK BA NHÁNH - THEO DÕI NGUY CƠ TIẾN TRIỂN THÀNH BLOCK TIM HOÀN TOÀN")
-            else:
-                findings.append(("Block Hai Nhánh", "Block hai nhánh (Bifascicular Block): Block nhánh phải kèm Block phân nhánh trái trước"))
-        elif lpfb:
-            if av_diag and "độ I" in av_diag:
-                findings.append(("Block Ba Nhánh", "Block ba nhánh (Trifascicular Block): Block nhánh phải + Block phân nhánh trái sau + Block nhĩ thất độ 1"))
-            else:
-                findings.append(("Block Hai Nhánh", "Block hai nhánh (Bifascicular Block): Block nhánh phải kèm Block phân nhánh trái sau"))
-
     return {"axis": axis_txt, "findings": findings, "alerts": alerts}
 
 def evaluate_preexcitation_and_ectopics_yds(data):
@@ -820,7 +747,6 @@ def evaluate_preexcitation_and_ectopics_yds(data):
     findings = []
     alerts = []
 
-    # 1. Kích thích sớm
     any_delta = any(l.get("has_delta", False) for l in leads.values())
     v1_r = leads.get("V1", {}).get("r_amp", 0.0)
     v1_s = leads.get("V1", {}).get("s_amp", 0.0)
@@ -847,7 +773,6 @@ def evaluate_preexcitation_and_ectopics_yds(data):
     elif pr < 0.12 and qrs <= 0.10 and not any_delta:
         findings.append(("Hội chứng kích thích sớm", "Hội chứng Lown-Ganong-Levine (LGL): Khoảng PR ngắn (< 0.12s), QRS bình thường, không có sóng Delta (Bó James)"))
 
-    # 2. Ngoại tâm thu
     early_indices = [i for i, r in enumerate(rr_list[:-1]) if r < 0.80 * mean_rr]
     if len(early_indices) > 0:
         pvc_count = 0
@@ -897,6 +822,106 @@ def evaluate_preexcitation_and_ectopics_yds(data):
 
     return {"findings": findings, "alerts": alerts}
 
+def evaluate_tachycardias_yds(data):
+    leads = data["leads"]
+    hr = data["hr"]
+    qrs = data["qrs"]
+    pr = data["pr"]
+    rr_cv = data["rr_cv"]
+    mean_rr = data["mean_rr"]
+    p_ratio = data["p_ratio"]
+
+    findings = []
+    alerts = []
+
+    if hr >= 220 and rr_cv > 0.30 and qrs >= 0.16:
+        findings.append(("Rối loạn nhịp thất ác tính", "Rung thất (Ventricular Fibrillation - VF): Hoạt động điện thất hỗn loạn, vô tổ chức, mất hoàn toàn phức bộ QRS"))
+        alerts.append("🚨 BÁO ĐỘNG ĐỎ: RUNG THẤT - BỆNH NHÂN NGƯNG TIM, KÍCH HOẠT CPR VÀ PHÁ RUNG NGAY")
+        return {"findings": findings, "alerts": alerts}
+
+    if 180 <= hr <= 300 and qrs >= 0.16 and rr_cv < 0.08:
+        findings.append(("Rối loạn nhịp thất ác tính", "Cuồng thất (Ventricular Flutter): Các sóng hình sin đều đặn liên tục, tần số 150-300 lần/phút"))
+        alerts.append("🚨 CẤP CỨU: CUỒNG THẤT - NGUY CƠ TIẾN TRIỂN THÀNH RUNG THẤT")
+        return {"findings": findings, "alerts": alerts}
+
+    v1_to_v6_amps = [leads.get(f"V{i}", {}).get("r_amp", 0.0) for i in range(1, 7)]
+    if hr >= 150 and max(v1_to_v6_amps) - min(v1_to_v6_amps) > 12.0 and rr_cv > 0.20:
+        findings.append(("Rối loạn nhịp thất ác tính", "Xoắn đỉnh (Torsades de Pointes): Nhịp nhanh thất đa dạng xoắn quanh đường đẳng điện"))
+        alerts.append("🚨 CẤP CỨU: XOẮN ĐỈNH - TRUYỀN MAGNESIUM SULFATE")
+        return {"findings": findings, "alerts": alerts}
+
+    if hr > 100 and qrs >= 0.12:
+        vt_criteria_met = []
+        d1 = leads.get("I", {})
+        avf = leads.get("aVF", {})
+        v1 = leads.get("V1", {})
+
+        net_d1 = d1.get("r_amp", 0.0) - d1.get("s_amp", 0.0)
+        net_avf = avf.get("r_amp", 0.0) - avf.get("s_amp", 0.0)
+        if net_d1 < 0 and net_avf < 0:
+            vt_criteria_met.append("Trục QRS vô định (DI âm, aVF âm)")
+        if qrs > 0.16:
+            vt_criteria_met.append(f"QRS rất rộng ({qrs*1000:.0f} ms > 160 ms)")
+
+        chest_signs = [(leads.get(f"V{i}", {}).get("r_amp", 0.0) - leads.get(f"V{i}", {}).get("s_amp", 0.0)) for i in range(1, 7)]
+        if all(s > 0 for s in chest_signs):
+            vt_criteria_met.append("QRS đồng hướng dương ở V1-V6")
+        elif all(s < 0 for s in chest_signs):
+            vt_criteria_met.append("QRS đồng hướng âm ở V1-V6")
+
+        if v1.get("left_rabbit_ear", False):
+            vt_criteria_met.append("Dấu hiệu tai thỏ với tai trái lớn hơn ở V1 (R > R')")
+
+        max_rs_time = max(l.get("r_to_s_time", 0.0) for l in leads.values())
+        if max_rs_time > 0.10:
+            vt_criteria_met.append(f"Dấu hiệu Brugada dương tính (R đến đáy S = {max_rs_time*1000:.0f} ms > 100 ms)")
+
+        if v1.get("has_josephson", False) or leads.get("V2", {}).get("has_josephson", False):
+            vt_criteria_met.append("Dấu hiệu Josephson dương tính (Khấc sườn xuống đáy sóng S tại V1/V2)")
+
+        if len(vt_criteria_met) >= 2 or (qrs > 0.16 and len(vt_criteria_met) >= 1):
+            findings.append(("Nhịp nhanh thất (VT)", f"Nhịp nhanh thất (Ventricular Tachycardia): {'; '.join(vt_criteria_met)}"))
+            alerts.append("🚨 CẤP CỨU: NHỊP NHANH THẤT (VT) - ĐÁNH GIÁ NGAY HUYẾT ĐỘNG ĐỂ SỐC ĐIỆN")
+            return {"findings": findings, "alerts": alerts}
+
+    if hr > 100 and qrs >= 0.12:
+        v1 = leads.get("V1", {})
+        if v1.get("true_rsr", False) and not v1.get("left_rabbit_ear", False):
+            findings.append(("Nhịp nhanh trên thất", "Nhịp nhanh trên thất dẫn truyền lệch hướng: QRS giãn rộng có dạng RBBB với tai thỏ bên phải cao hơn ở V1"))
+            return {"findings": findings, "alerts": alerts}
+        elif any(l.get("has_delta", False) for l in leads.values()):
+            findings.append(("Nhịp nhanh trên thất", "Nhịp nhanh vào lại nhĩ thất dẫn truyền ngược dòng (Antidromic AVRT)"))
+            return {"findings": findings, "alerts": alerts}
+
+    if hr > 100 and qrs < 0.12:
+        if rr_cv > 0.20 and p_ratio < 0.20:
+            findings.append(("Rối loạn nhịp nhĩ", f"Rung nhĩ đáp ứng thất nhanh (AFib with RVR) - Tần số: {hr} l/p"))
+            return {"findings": findings, "alerts": alerts}
+        if 135 <= hr <= 165 and any(abs(l.get("st_shift", 0.0)) > 0 for l in leads.values()):
+            findings.append(("Rối loạn nhịp nhĩ", f"Cuồng nhĩ (Atrial Flutter): Nghi ngờ cuồng nhĩ dẫn truyền 2:1 (Tần số thất {hr} l/p)"))
+            return {"findings": findings, "alerts": alerts}
+        if rr_cv > 0.15 and p_ratio >= 0.50:
+            findings.append(("Rối loạn nhịp nhĩ", f"Nhịp nhanh nhĩ đa ổ (MAT) - Tần số: {hr} l/p"))
+            return {"findings": findings, "alerts": alerts}
+
+        rp_val = max(l.get("rp_interval", 0.0) for l in leads.values())
+        pseudo_r = leads.get("V1", {}).get("pseudo_r_prime", False)
+        p_inv = any(leads.get(ld, {}).get("p_inverted", False) for ld in ["II", "III", "aVF"])
+
+        if pseudo_r or (0 < rp_val <= 0.09):
+            findings.append(("Nhịp nhanh vào lại nút nhĩ thất (AVNRT)", f"AVNRT thể điển hình (Slow-Fast): Nhịp nhanh đều ({hr} l/p), QRS hẹp, RP ≤ 90 ms"))
+        elif rp_val > 0.09 and rp_val < pr:
+            findings.append(("Nhịp nhanh vào lại nhĩ thất (AVRT)", f"Orthodromic AVRT: Nhịp nhanh đều ({hr} l/p), QRS hẹp, RP dài > 90 ms"))
+        elif p_inv and pr < 0.12:
+            findings.append(("Nhịp nhanh bộ nối (JET)", f"Nhịp nhanh bộ nối (JET) - Tần số: {hr} l/p"))
+        else:
+            findings.append(("Nhịp nhanh trên thất", f"Nhịp nhanh kịch phát trên thất (SVT) - Tần số: {hr} l/p"))
+
+    return {"findings": findings, "alerts": alerts}
+
+# =========================================================================
+# 6. ĐIỀU PHỐI CHẨN ĐOÁN TOÀN BỘ BỆNH LÝ
+# =========================================================================
 def diagnose_ecg_comprehensive(data, gender="Nam", age=55):
     leads = data.get("leads", {})
     hr = data.get("hr", 72)
@@ -906,60 +931,39 @@ def diagnose_ecg_comprehensive(data, gender="Nam", age=55):
     findings = []
     alerts = []
 
-    # 1. Khảo sát Block dẫn truyền & Nhịp chậm
+    # 1. Khảo sát Nhiễu & Sai lệch điện cực (Checklist CAPS SCAN)
+    tech_res = evaluate_artifacts_and_lead_reversals(leads)
+    findings.extend(tech_res["findings"])
+    alerts.extend(tech_res["alerts"])
+
+    # 2. Khảo sát Block dẫn truyền & Nhịp chậm
     cond_res = evaluate_conduction_and_bradycardia_yds(data)
     axis_txt = cond_res["axis"]
     findings.extend(cond_res["findings"])
     alerts.extend(cond_res["alerts"])
 
-    # 2. Khảo sát Kích thích sớm & Ngoại tâm thu
+    # 3. Khảo sát Kích thích sớm & Ngoại tâm thu
     pre_res = evaluate_preexcitation_and_ectopics_yds(data)
     findings.extend(pre_res["findings"])
     alerts.extend(pre_res["alerts"])
 
-    # 3. Khảo sát Nhịp Nhanh Trên Thất & Nhịp Nhanh Thất (Chương 11, 12, 13)
+    # 4. Khảo sát Nhịp Nhanh SVT & VT
     tachy_res = evaluate_tachycardias_yds(data)
     findings.extend(tachy_res["findings"])
     alerts.extend(tachy_res["alerts"])
 
-    # 4. Khảo sát Hội chứng Vành Cấp & Mạn
+    # 5. Khảo sát Hội chứng Vành Cấp & Mạn
     coronary_res = evaluate_yds_coronary_syndromes(leads, gender=gender, age=age)
     findings.extend(coronary_res["findings"])
     alerts.extend(coronary_res["alerts"])
 
-    # 5. Dày thất & Lớn nhĩ
-    v1_data = leads.get("V1", {})
-    v5_data = leads.get("V5", {})
-    v6_data = leads.get("V6", {})
-    avl_data = leads.get("aVL", {})
-    v3_data = leads.get("V3", {})
-    d2 = leads.get("II", {})
-
-    sokolow_lv = v1_data.get("s_amp", 0.0) + max(v5_data.get("r_amp", 0.0), v6_data.get("r_amp", 0.0))
-    cornell_val = avl_data.get("r_amp", 0.0) + v3_data.get("s_amp", 0.0)
-    cornell_cutoff = 28.0 if gender == "Nam" else 20.0
-
-    if sokolow_lv >= 35.0:
-        findings.append(("Phì đại thất", f"Dày thất trái (LVH) theo Sokolow-Lyon: SV1 + RV5 = {sokolow_lv:.1f} mm (≥ 35 mm)"))
-    elif cornell_val > cornell_cutoff:
-        findings.append(("Phì đại thất", f"Dày thất trái (LVH) theo Cornell: RaVL + SV3 = {cornell_val:.1f} mm (> {cornell_cutoff:.0f} mm ở {gender})"))
-
-    rv1 = v1_data.get("r_amp", 0.0)
-    sv1 = v1_data.get("s_amp", 0.0)
-    if rv1 >= 7.0 and (sv1 > 0 and rv1 / sv1 > 1.2) and "phải" in axis_txt:
-        findings.append(("Phì đại thất", f"Dày thất phải (RVH): Sóng R cao ưu thế ở V1 ({rv1:.1f} mm) kèm trục lệch phải"))
-
-    p_amp_d2 = d2.get("p_amp", 0.0)
-    p_amp_d3 = leads.get("III", {}).get("p_amp", 0.0)
-    p_amp_avf = leads.get("aVF", {}).get("p_amp", 0.0)
-    max_p = max(p_amp_d2, p_amp_d3, p_amp_avf)
-    if 2.5 <= max_p <= 4.5:
-        findings.append(("Lớn buồng tim", f"Lớn nhĩ phải (P phế): Sóng P cao {max_p:.1f} mm (≥ 2.5 mm ở DII/DIII/aVF)"))
-    elif v1_data.get("p_biphasic", False) and d2.get("p_dur", 0.08) >= 0.12:
-        findings.append(("Lớn buồng tim", "Lớn nhĩ trái (P nhĩ): Sóng P rộng ≥ 0.12s hoặc 2 pha âm chiếm ưu thế ở V1"))
+    # 6. Khảo sát Lớn nhĩ, Dày thất & Dày hai thất chuẩn YDS 2026
+    hyp_res = evaluate_atrial_ventricular_hypertrophy_yds(leads, gender=gender)
+    findings.extend(hyp_res["findings"])
+    alerts.extend(hyp_res["alerts"])
 
     # Lọc bỏ thông báo nhịp xoang nếu đã phát hiện rối loạn nhịp nặng
-    if not any("Rối loạn nhịp" in f[0] or "Nhịp nhanh" in f[0] or "Block nhĩ thất" in f[0] or "Hội chứng kích thích sớm" in f[0] for f in findings):
+    if not any(k in f[0] for f in findings for k in ["Rối loạn nhịp", "Nhịp nhanh", "Block nhĩ thất", "Hội chứng kích thích sớm"]):
         if hr > 100:
             findings.append(("Nhịp học", f"Nhịp nhanh xoang: Tần số {hr} lần/phút"))
         elif hr < 60:
@@ -969,14 +973,16 @@ def diagnose_ecg_comprehensive(data, gender="Nam", age=55):
 
     return {
         "axis": axis_txt,
-        "sokolow": sokolow_lv,
-        "cornell": cornell_val,
+        "sokolow": hyp_res["sokolow_lv"],
+        "sokolow_rv": hyp_res["sokolow_rv"],
+        "cornell": hyp_res["cornell"],
+        "re_score": hyp_res["re_score"],
         "findings": findings,
         "alerts": alerts
     }
 
 # =========================================================================
-# 5. GIAO DIỆN HIỂN THỊ STREAMLIT
+# 7. GIAO DIỆN HIỂN THỊ STREAMLIT
 # =========================================================================
 col1, col2 = st.columns([1, 1], gap="large")
 
@@ -996,9 +1002,9 @@ with col1:
         st.info("Vui lòng tải ảnh phiếu đo ECG lên để phân tích.")
 
 with col2:
-    st.subheader("2. Kết Quả Chẩn Đoán Chuyên Khoa YDS")
+    st.subheader("2. Kết Quả Chẩn Đoán Chuyên Khoa Toàn Diện")
     if uploaded:
-        with st.spinner("Đang đo đạc theo tiêu chuẩn Sổ tay ĐTĐ YDS 2026 (VT, SVT, AVNRT, WPW, STEMI)..."):
+        with st.spinner("Đang kiểm tra CAPS SCAN, đo đạc sóng P-QRS-ST-T, bóc tách lớn nhĩ, dày thất và loạn nhịp..."):
             res = process_ecg_dataset(img_pil)
             diag = diagnose_ecg_comprehensive(res, gender=gender_choice, age=age_choice)
 
@@ -1014,25 +1020,25 @@ with col2:
         m1.metric("Tần số (HR)", f"{res['hr']} bpm")
         m2.metric("Khoảng PR", f"{res['pr']:.2f} s", delta="Ngắn (<0.12s)" if res['pr'] < 0.12 else ("Kéo dài (>0.20s)" if res['pr'] > 0.20 else "Bình thường"), delta_color="inverse" if (res['pr'] < 0.12 or res['pr'] > 0.20) else "normal")
         m3.metric("Độ rộng QRS", f"{res['qrs']:.3f} s")
-        m4.metric("Sokolow-Lyon", f"{diag['sokolow']:.1f} mm")
+        m4.metric("Sokolow-Lyon (Trái)", f"{diag['sokolow']:.1f} mm")
 
-        st.write(f"📐 **Trục điện tim:** `{diag['axis']}` | **Chu kỳ R-R:** `{res['mean_rr']:.2f} s`")
+        st.write(f"📐 **Trục điện tim:** `{diag['axis']}` | **Cornell:** `{diag['cornell']:.1f} mm` | **Điểm Romhilt-Estes:** `{diag['re_score']}/13`")
         st.markdown("---")
 
         st.markdown("#### Kết Luận Chẩn Đoán Phân Tầng")
         if diag["findings"]:
             for cat, desc in diag["findings"]:
-                if any(k in desc for k in ["STEMI", "độ III", "Rung thất", "Cuồng thất", "Xoắn đỉnh", "Nhịp nhanh thất", "cao độ", "LMCA"]):
+                if any(k in desc for k in ["STEMI", "độ III", "Rung thất", "Cuồng thất", "Xoắn đỉnh", "Nhịp nhanh thất", "cao độ", "LMCA", "ngưng xoang > 3 giây"]):
                     st.markdown(f"- **[{cat}]** :red[{desc}]")
-                elif any(k in desc for k in ["WPW", "Wellens", "Ngoại tâm thu", "Block", "NSTE-ACS", "LGL", "AVNRT", "AVRT", "JET"]):
+                elif any(k in desc for k in ["WPW", "Wellens", "Ngoại tâm thu", "Block", "NSTE-ACS", "LGL", "AVNRT", "AVRT", "JET", "Dày", "Lớn", "Sai lệch"]):
                     st.markdown(f"- **[{cat}]** :orange[{desc}]")
                 else:
                     st.markdown(f"- **[{cat}]** :green[{desc}]")
         else:
-            st.success("✅ Bản ghi bình thường, không phát hiện rối loạn nhịp, rối loạn dẫn truyền hoặc bệnh lý mạch vành.")
+            st.success("✅ Bản ghi bình thường, không phát hiện nhiễu, sai lệch điện cực, phì đại buồng tim, loạn nhịp hoặc bệnh mạch vành.")
 
         st.markdown("---")
-        with st.expander("🔍 Chi Tiết Đo Đạc Đoạn ST, Sóng T, QRS & Khoảng Dẫn Truyền"):
+        with st.expander("🔍 Chi Tiết Đo Đạc Hình Thái 12 Chuyển Đạo (P, Q, R, S, ST, T, Delta, VAT)"):
             detail_list = []
             for l_name, l_data in res["leads"].items():
                 st_val = l_data.get('st_shift', 0.0)
@@ -1051,9 +1057,10 @@ with col2:
                     "Đánh giá ST": eval_txt,
                     "Sóng T (mm)": f"{t_val:+.1f}",
                     "QRS (s)": f"{l_data.get('qrs_w', 0.08):.3f}",
-                    "Delta / Tai thỏ": "Delta" if l_data.get('has_delta') else ("rsR'" if l_data.get('true_rsr') else "-"),
-                    "PR (s)": f"{l_data.get('pr_interval', 0.16):.2f}",
-                    "RP (s)": f"{l_data.get('rp_interval', 0.0):.2f}"
+                    "VAT (s)": f"{l_data.get('vat', 0.03):.3f}",
+                    "Sóng R (mm)": f"{l_data.get('r_amp', 0.0):.1f}",
+                    "Sóng S (mm)": f"{l_data.get('s_amp', 0.0):.1f}",
+                    "PR (s)": f"{l_data.get('pr_interval', 0.16):.2f}"
                 })
             st.dataframe(detail_list, use_container_width=True, height=260)
     else:
