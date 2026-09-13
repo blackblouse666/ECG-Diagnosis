@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 st.title("🫀 Hệ Thống AI Chẩn Đoán ECG Đa Tầng (AHA/ACC/ESC)")
-st.caption("Bóc tách thích ứng đa phổ màu; Định vị điểm J đa hình thái; Chẩn đoán chính xác STEMI Trước Rộng (V1-V5)")
+st.caption("Chuẩn hóa tiêu chuẩn Sóng Q hoại tử theo vùng liên tiếp; Chẩn đoán chính xác Thiếu máu cục bộ cơ tim (ST chênh xuống / T âm)")
 
 LEAD_GRID = [
     ["I",   "aVR", "V1", "V4"],
@@ -21,30 +21,21 @@ LEAD_GRID = [
 ]
 
 # =========================================================================
-# 1. TIỀN XỬ LÝ NÂNG CAO: TỰ ĐỘNG BẮT NÉT CHÌ MỜ & KHỬ LƯỚI HỒNG
+# 1. TIỀN XỬ LÝ & BÓC TÁCH NÉT MỰC
 # =========================================================================
 def extract_robust_ecg_traces(rgb_img):
-    """
-    Sử dụng thuật toán Color Difference & Adaptive Thresholding để bóc tách 
-    chính xác nét chì dù ảnh chụp mờ hoặc có lưới hồng đậm/nhạt.
-    """
     img_float = rgb_img.astype(np.float32)
     r = img_float[:, :, 0]
     g = img_float[:, :, 1]
     b = img_float[:, :, 2]
 
-    # Lưới điện tim thường có R > G và R > B (tông đỏ/hồng). Nét mực chì có R ~ G ~ B thấp.
-    # Tính chỉ số màu xám/đen tách biệt khỏi sắc tố đỏ
     gray_evidence = np.maximum(np.abs(r - g), np.abs(r - b))
     brightness = (r + g + b) / 3.0
 
-    # Mặt nạ: Nét chì có độ chênh lệch màu thấp (ít sắc tố) và độ sáng thấp hơn nền
     mask_trace = (gray_evidence < 35) & (brightness < 175)
-
     binary = np.zeros(rgb_img.shape[:2], dtype=np.uint8)
     binary[mask_trace] = 255
 
-    # Trường hợp ảnh quá nhạt, bổ sung Adaptive Thresholding trên kênh Green
     if np.mean(binary > 0) < 0.015:
         gray_fallback = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -53,10 +44,8 @@ def extract_robust_ecg_traces(rgb_img):
             enhanced, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 17, 10
         )
 
-    # Lọc nhiễu đốm nhỏ
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    return cleaned
+    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
 def extract_signal_from_roi(roi):
     h, w = roi.shape
@@ -70,12 +59,12 @@ def extract_signal_from_roi(roi):
     return np.array(signal)
 
 # =========================================================================
-# 2. ĐO ĐẠC ĐA HÌNH THÁI: TÌM ĐỈNH R, ĐIỂM J VÀ ĐỘ CHÊNH ST THỰC TẾ
+# 2. ĐO ĐẠC HÌNH THÁI VI THỂ (ĐIỂM J, ST, SÓNG T, SÓNG Q)
 # =========================================================================
 def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
     default_props = {
         "r_amp": 0.0, "s_amp": 0.0, "q_amp": 0.0, "q_dur": 0.0,
-        "st_shift": 0.0, "qrs_w": 0.08, "pr_interval": 0.16,
+        "st_shift": 0.0, "t_amp": 0.0, "qrs_w": 0.08, "pr_interval": 0.16,
         "p_amp": 0.0, "p_detected": False, "p_biphasic": False,
         "true_rsr": False, "slurred_s": False, "notched_r": False,
         "r_peaks": [], "rr_intervals": []
@@ -91,14 +80,8 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
     amp_span = np.max(sig_search) - np.min(sig_search)
     prom_val = amp_span * 0.25 if amp_span > 6.0 else 3.0
 
-    peaks, _ = find_peaks(
-        raw_sig,
-        distance=int(px_per_sec * 0.35),
-        prominence=prom_val
-    )
+    peaks, _ = find_peaks(raw_sig, distance=int(px_per_sec * 0.35), prominence=prom_val)
     peaks = [p for p in peaks if p > cut_start]
-
-    # Nếu không tìm được đỉnh R nổi trội, thử hạ ngưỡng prominence
     if len(peaks) == 0:
         peaks, _ = find_peaks(raw_sig, distance=int(px_per_sec * 0.35), prominence=2.0)
         peaks = [p for p in peaks if p > cut_start]
@@ -106,7 +89,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             return default_props
 
     r_amps, s_amps, q_amps, q_durs = [], [], [], []
-    st_shifts, qrs_widths, pr_intervals, p_amps = [], [], [], []
+    st_shifts, t_amps, qrs_widths, pr_intervals, p_amps = [], [], [], [], []
     has_true_rsr = False
     has_slurred_s = False
     has_notched_r = False
@@ -114,7 +97,6 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
     p_biphasic = False
 
     for r in peaks:
-        # Đường đẳng điện chuẩn lấy tại đoạn PR (60-120ms trước R)
         pr_zone = raw_sig[max(0, r - int(px_per_sec * 0.14)):max(0, r - int(px_per_sec * 0.05))]
         baseline_val = np.median(pr_zone) if len(pr_zone) > 0 else np.median(raw_sig)
         sig = raw_sig - baseline_val
@@ -122,15 +104,27 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         r_val = max(0.0, (sig[r] / px_per_mv) * 10.0)
         r_amps.append(r_val)
 
-        # Tìm chân sóng S hoặc điểm kết thúc R (nếu không có S trong dạng vòm)
+        # 1. Đo sóng Q bệnh lý thực sự (chỉ tính phần âm trước R)
+        q_zone = sig[max(0, r - int(px_per_sec * 0.08)):r]
+        if len(q_zone) > 0 and np.min(q_zone) < 0:
+            q_peak_idx = np.argmin(q_zone)
+            q_depth_mm = (abs(q_zone[q_peak_idx]) / px_per_mv) * 10.0
+            # Đo độ rộng ở mức 0.5mm âm
+            q_negative_pts = np.where(q_zone < -0.05 * max(r_val * (px_per_mv / 10.0), 5.0))[0]
+            q_duration_sec = len(q_negative_pts) / px_per_sec
+            q_amps.append(q_depth_mm)
+            q_durs.append(q_duration_sec)
+        else:
+            q_amps.append(0.0)
+            q_durs.append(0.0)
+
+        # 2. Tìm sóng S và Điểm J
         s_search = sig[r:min(len(sig), r + int(px_per_sec * 0.14))]
         if len(s_search) > 2:
             min_s_idx = np.argmin(s_search)
             s_val = (abs(min(0.0, s_search[min_s_idx])) / px_per_mv) * 10.0
             s_amps.append(s_val)
 
-            # Xác định điểm J: Nơi kết thúc sườn dốc xuống của R/S
-            # Quét tìm điểm có tốc độ biến thiên nhỏ nhất trong khoảng 40-80ms sau R
             j_search_zone = s_search[max(1, int(px_per_sec * 0.04)):min(len(s_search), int(px_per_sec * 0.09))]
             if len(j_search_zone) > 0:
                 j_idx = r + max(1, int(px_per_sec * 0.04)) + int(np.argmin(np.abs(np.diff(j_search_zone, prepend=j_search_zone[0]))))
@@ -140,22 +134,20 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             j_idx = min(len(sig) - 1, r + int(px_per_sec * 0.06))
             s_amps.append(0.0)
 
-        # Đo độ chênh ST tại điểm J (mm)
+        # 3. Đo độ lệch ST tại điểm J (mm)
         st_shift_mm = (sig[j_idx] / px_per_mv) * 10.0
         st_shifts.append(st_shift_mm)
 
-        # Sóng Q hoại tử
-        q_zone = sig[max(0, r - int(px_per_sec * 0.07)):r]
-        if len(q_zone) > 0 and np.min(q_zone) < 0:
-            q_val = (abs(np.min(q_zone)) / px_per_mv) * 10.0
-            q_dur = len(np.where(q_zone < -0.10 * sig[r])[0]) / px_per_sec
-            q_amps.append(q_val)
-            q_durs.append(q_dur)
+        # 4. Đo biên độ sóng T (khoảng 120ms đến 280ms sau R)
+        t_zone = sig[min(len(sig) - 1, r + int(px_per_sec * 0.12)):min(len(sig), r + int(px_per_sec * 0.30))]
+        if len(t_zone) > 5:
+            # Lấy cực trị có độ lệch lớn nhất so với baseline
+            t_extrema = t_zone[np.argmax(np.abs(t_zone))]
+            t_amps.append((t_extrema / px_per_mv) * 10.0)
         else:
-            q_amps.append(0.0)
-            q_durs.append(0.0)
+            t_amps.append(0.0)
 
-        # Đo độ rộng QRS
+        # 5. Đo QRS
         left_idx = r
         while left_idx > max(0, r - int(px_per_sec * 0.10)) and sig[left_idx] > 0.15 * sig[r]:
             left_idx -= 1
@@ -164,7 +156,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             right_idx += 1
         qrs_widths.append((right_idx - left_idx) / px_per_sec)
 
-        # Sóng P và khoảng PR (120ms - 360ms trước R)
+        # 6. Sóng P và khoảng PR
         p_zone_start = max(0, r - int(px_per_sec * 0.36))
         p_zone_end = max(0, r - int(px_per_sec * 0.10))
         p_zone = sig[p_zone_start:p_zone_end]
@@ -188,6 +180,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         "q_amp": float(np.median(q_amps)) if q_amps else 0.0,
         "q_dur": float(np.max(q_durs)) if q_durs else 0.0,
         "st_shift": float(np.median(st_shifts)) if st_shifts else 0.0,
+        "t_amp": float(np.median(t_amps)) if t_amps else 0.0,
         "qrs_w": avg_qrs,
         "pr_interval": float(np.median(pr_intervals)) if pr_intervals else 0.16,
         "p_amp": float(np.median(p_amps)) if p_amps else 1.0,
@@ -255,78 +248,100 @@ def process_ecg_dataset(pil_img: Image.Image):
     }
 
 # =========================================================================
-# 3. QUY TRÌNH CHẨN ĐOÁN STEMI CHẶT CHẼ (ESC/AHA 4th DEFINITION)
+# 3. TIÊU CHUẨN ĐỒNG THUẬN VỀ BỆNH MẠCH VÀNH (ESC / AHA)
 # =========================================================================
-def evaluate_stemi_criteria(leads, gender="Nam", age=55):
-    st_elev_leads = []
-    st_depr_leads = []
-    path_q_leads = []
+def evaluate_ischemia_and_infarction(leads, gender="Nam", age=55):
+    """
+    Tiêu chuẩn chuẩn hóa:
+    1. LOẠI TRỪ aVR khỏi mọi tiêu chuẩn sóng Q bệnh lý.
+    2. Sóng Q bệnh lý thực sự (Pathological Q):
+       - Độ rộng >= 0.04s (40ms) VÀ độ sâu >= 1.0mm (hoặc >= 25% biên độ R).
+       - BẮT BUỘC xuất hiện ở ít nhất 2 chuyển đạo liên tiếp cùng vùng:
+         + Thành dưới: ít nhất 2 trong 3 lead (DII, DIII, aVF). DIII đứng một mình KHÔNG TÍNH.
+         + Thành trước: V1-V2, V2-V3, hoặc V3-V4.
+         + Thành bên: DI kèm aVL, hoặc V5 kèm V6.
+    3. Thiếu máu cục bộ cơ tim (Myocardial Ischemia / NSTEMI):
+       - ST chênh xuống dạng ngang hoặc dốc xuống >= 0.5mm ở ít nhất 2 chuyển đạo liên tiếp.
+       - Hoặc sóng T âm sâu đối xứng >= 1.0mm ở các chuyển đạo có R ưu thế (loại trừ aVR, V1).
+    """
+    pathological_q_leads = []
+    st_elevation_leads = []
+    st_depression_leads = []
+    t_inversion_leads = []
 
     for l_name, l_data in leads.items():
+        if l_name == "aVR":
+            continue  # aVR luôn âm sinh lý, bỏ qua đánh giá Q hoại tử và T âm
+
         st_val = l_data.get("st_shift", 0.0)
+        t_val = l_data.get("t_amp", 0.0)
+        q_dur = l_data.get("q_dur", 0.0)
+        q_amp = l_data.get("q_amp", 0.0)
+        r_amp = l_data.get("r_amp", 0.0)
 
-        # Ngưỡng ST chênh lên chuẩn AHA/ESC
-        if l_name in ["V2", "V3"]:
-            if gender == "Nữ":
-                cutoff = 1.5
-            else:
-                cutoff = 2.0 if age >= 40 else 2.5
-        else:
-            cutoff = 1.0
+        # ST chênh lên chuẩn
+        st_cutoff = 1.5 if (l_name in ["V2", "V3"] and gender == "Nữ") else (2.0 if l_name in ["V2", "V3"] else 1.0)
+        if st_val >= st_cutoff:
+            st_elevation_leads.append(l_name)
 
-        if st_val >= cutoff:
-            st_elev_leads.append(l_name)
-        elif st_val <= -0.75:
-            st_depr_leads.append(l_name)
+        # ST chênh xuống (Thiếu máu cục bộ)
+        if st_val <= -0.5:
+            st_depression_leads.append(l_name)
 
-        if l_data.get("q_dur", 0.0) >= 0.035 and (l_data.get("r_amp", 0.0) > 0 and l_data.get("q_amp", 0.0) >= 0.25 * l_data.get("r_amp", 0.0)):
-            path_q_leads.append(l_name)
+        # Sóng T âm sâu (Thiếu máu cục bộ)
+        if t_val <= -1.0 and l_name != "V1":
+            t_inversion_leads.append(l_name)
 
-    st_set = set(st_elev_leads)
-    dep_set = set(st_depr_leads)
-    stemi_findings = []
-    culprit_arteries = []
+        # Sóng Q bệnh lý thực sự
+        is_true_q = False
+        if q_dur >= 0.038 and q_amp >= 1.0:
+            if r_amp > 0 and (q_amp / r_amp) >= 0.25:
+                is_true_q = True
+            elif r_amp == 0 and q_amp >= 2.0:  # Dạng QS
+                is_true_q = True
 
-    # 1. Trước Rộng (Extensive Anterior): V1-V4 hoặc V1-V5 hoặc V1-V6
-    anterior_leads = {"V1", "V2", "V3", "V4", "V5"}.intersection(st_set)
-    if len(anterior_leads) >= 3:
-        stemi_findings.append(f"Thành trước rộng (Extensive Anterior: {', '.join(sorted(list(anterior_leads)))})")
-        culprit_arteries.append("ĐM Liên Thất Trước đoạn gần (Proximal LAD) hoặc Thân chung LMCA")
-    elif {"V1", "V2", "V3", "V4"}.issubset(st_set):
-        stemi_findings.append("Trước - Vách (Anteroseptal: V1-V4)")
-        culprit_arteries.append("LAD đoạn gần")
-    elif {"V1", "V2"}.issubset(st_set):
-        stemi_findings.append("Vách liên thất (Septal: V1-V2)")
-        culprit_arteries.append("Nhánh vách của LAD")
-    elif {"V3", "V4"}.issubset(st_set):
-        stemi_findings.append("Thành trước (Anterior: V3-V4)")
-        culprit_arteries.append("LAD đoạn giữa")
+        if is_true_q:
+            pathological_q_leads.append(l_name)
 
-    # 2. Thành Dưới (Inferior): DII, DIII, aVF
-    inferior_leads = {"II", "III", "aVF"}.intersection(st_set)
-    if len(inferior_leads) >= 2:
-        recip_txt = " (Kèm soi gương ở aVL/DI)" if len({"aVL", "I"}.intersection(dep_set)) >= 1 else ""
-        stemi_findings.append(f"Thành dưới (Inferior: {', '.join(inferior_leads)}){recip_txt}")
-        culprit_arteries.append("ĐM Vành Phải (RCA) hoặc ĐM Mũ (LCx)")
+    # Lọc sóng Q theo vùng liên tiếp (Contiguous leads requirement)
+    confirmed_old_mi_regions = []
+    q_set = set(pathological_q_leads)
 
-    # 3. Thành Bên (Lateral): DI, aVL, V5, V6
-    lateral_leads = {"I", "aVL", "V5", "V6"}.intersection(st_set)
-    if len(lateral_leads) >= 2 and not anterior_leads:
-        stemi_findings.append(f"Thành bên (Lateral: {', '.join(lateral_leads)})")
-        culprit_arteries.append("ĐM Mũ (LCx)")
+    # Thành dưới: Phải có ít nhất 2 lead (DII kèm aVF, hoặc DIII kèm aVF/DII)
+    inf_q = {"II", "III", "aVF"}.intersection(q_set)
+    if len(inf_q) >= 2:
+        confirmed_old_mi_regions.append(f"Thành dưới (Inferior: {', '.join(sorted(list(inf_q)))})")
 
-    stage_str = "Tối cấp / Cấp tính (Hyperacute / Acute)"
-    if any(l in set(path_q_leads) for l in st_elev_leads):
-        stage_str = "Bán cấp / Hoại tử tiến triển (Đã có sóng Q)"
+    # Thành trước vách
+    if {"V1", "V2"}.issubset(q_set) or {"V2", "V3"}.issubset(q_set):
+        confirmed_old_mi_regions.append("Trước - Vách (Anteroseptal)")
+    if {"V3", "V4"}.issubset(q_set):
+        confirmed_old_mi_regions.append("Thành trước (Anterior)")
+
+    # Thành bên
+    if {"I", "aVL"}.issubset(q_set) or {"V5", "V6"}.issubset(q_set):
+        confirmed_old_mi_regions.append("Thành bên (Lateral)")
+
+    # Lọc vùng thiếu máu cục bộ (ST chênh xuống hoặc T âm ở >= 2 chuyển đạo liên tiếp)
+    ischemia_leads = sorted(list(set(st_depression_leads + t_inversion_leads)))
+    ischemia_set = set(ischemia_leads)
+    confirmed_ischemia_regions = []
+
+    if len({"II", "III", "aVF"}.intersection(ischemia_set)) >= 2:
+        confirmed_ischemia_regions.append(f"Thành dưới ({', '.join(sorted(list({'II', 'III', 'aVF'}.intersection(ischemia_set))))})")
+    if len({"V4", "V5", "V6"}.intersection(ischemia_set)) >= 2:
+        confirmed_ischemia_regions.append(f"Thành trước - bên ({', '.join(sorted(list({'V4', 'V5', 'V6'}.intersection(ischemia_set))))})")
+    if {"I", "aVL"}.issubset(ischemia_set):
+        confirmed_ischemia_regions.append("Thành bên cao (DI, aVL)")
+    if len({"V1", "V2", "V3"}.intersection(ischemia_set)) >= 2:
+        confirmed_ischemia_regions.append(f"Trước - Vách ({', '.join(sorted(list({'V1', 'V2', 'V3'}.intersection(ischemia_set))))})")
 
     return {
-        "is_stemi": len(stemi_findings) > 0,
-        "regions": stemi_findings,
-        "arteries": list(set(culprit_arteries)),
-        "stage": stage_str,
-        "st_elev_leads": st_elev_leads,
-        "st_depr_leads": st_depr_leads,
-        "q_leads": path_q_leads
+        "st_elevation_leads": st_elevation_leads,
+        "old_mi_regions": confirmed_old_mi_regions,
+        "ischemia_regions": confirmed_ischemia_regions,
+        "ischemia_leads": ischemia_leads,
+        "raw_q_leads": pathological_q_leads
     }
 
 # =========================================================================
@@ -364,7 +379,7 @@ def diagnose_ecg_comprehensive(data, gender="Nam", age=55):
     # 2. Rối loạn nhịp
     if rr_cv > 0.24 and p_ratio < 0.20:
         findings.append(("Rối loạn nhịp", "Rung nhĩ (AFib): Mất sóng P, nhịp thất hoàn toàn không đều"))
-        alerts.append("⚠️ Rung nhĩ: Đánh giá nguy cơ thuyên tắc mạch (CHA2DS2-VASc)")
+        alerts.append("⚠️ Rung nhĩ: Đánh giá nguy cơ tắc mạch (CHA2DS2-VASc)")
     else:
         if hr > 100:
             findings.append(("Rối loạn nhịp", f"Nhịp nhanh xoang (Sinus Tachycardia) - Tần số: {hr} l/p"))
@@ -378,19 +393,28 @@ def diagnose_ecg_comprehensive(data, gender="Nam", age=55):
         findings.append(("Dẫn truyền nhĩ - thất", f"Block nhĩ - thất độ I: Khoảng PR kéo dài cố định ({pr:.2f}s > 0.20s)"))
     elif hr < 45 and qrs >= 0.12 and rr_cv < 0.04:
         findings.append(("Dẫn truyền nhĩ - thất", "Block nhĩ - thất độ III: Phân ly nhĩ thất hoàn toàn"))
-        alerts.append("🚨 BLOCK TIM ĐỘ 3: CHỈ ĐỊNH ĐẶT MÁY TẠO NHỊP CẤP CỨU")
+        alerts.append("🚨 BLOCK TIM ĐỘ 3: CHỈ ĐẶT MÁY TẠO NHỊP CẤP CỨU")
 
-    # 4. Hội chứng vành cấp (STEMI)
-    stemi_res = evaluate_stemi_criteria(leads, gender=gender, age=age)
-    if stemi_res["is_stemi"]:
-        reg_txt = " + ".join(stemi_res["regions"])
-        art_txt = f" (ĐM thủ phạm dự đoán: {', '.join(stemi_res['arteries'])})" if stemi_res["arteries"] else ""
-        findings.append(("Hội chứng vành cấp (ACS)", f"Nhồi máu cơ tim ST chênh lên (STEMI) - Vùng: {reg_txt} - Giai đoạn: {stemi_res['stage']}{art_txt}"))
-        alerts.append(f"🚨 CẤP CỨU: STEMI VÙNG {reg_txt.upper()} - KÍCH HOẠT CATH-LAB CAN THIỆP PCI KHẨN CẤP")
-    elif len(stemi_res["q_leads"]) >= 2:
-        findings.append(("Hội chứng vành mạn (CCS)", f"Sẹo hoại tử / Nhồi máu cơ tim cũ (Old MI) tại: {', '.join(stemi_res['q_leads'])}"))
-    elif len(stemi_res["st_depr_leads"]) >= 2:
-        findings.append(("Thiếu máu cục bộ", f"ST chênh xuống / Thiếu máu cơ tim dưới nội tâm mạc (NSTEMI) tại: {', '.join(stemi_res['st_depr_leads'])}"))
+    # 4. ĐÁNH GIÁ CHUẨN XÁC: THIẾU MÁU CỤC BỘ vs NHỒI MÁU CŨ vs STEMI
+    coronary_res = evaluate_ischemia_and_infarction(leads, gender=gender, age=age)
+    
+    # Ưu tiên 1: STEMI nếu có ST chênh lên
+    stemi_leads = coronary_res["st_elevation_leads"]
+    if len(stemi_leads) >= 2:
+        findings.append(("Hội chứng vành cấp (ACS)", f"Nhồi máu cơ tim ST chênh lên (STEMI) tại: {', '.join(stemi_leads)}"))
+        alerts.append(f"🚨 CẢNH BÁO: THEO DÕI STEMI TẠI {', '.join(stemi_leads)} - CẦN ĐỐI CHIẾU LÂM SÀNG CẤP CỨU")
+    
+    # Ưu tiên 2: Thiếu máu cục bộ cơ tim (ST chênh xuống / T âm)
+    elif coronary_res["ischemia_regions"]:
+        reg_txt = " + ".join(coronary_res["ischemia_regions"])
+        findings.append(("Bệnh mạch vành", f"Thiếu máu cục bộ cơ tim (ST chênh xuống / T âm sâu) - Vùng: {reg_txt}"))
+        alerts.append(f"⚠️ Phát hiện Thiếu máu cục bộ cơ tim vùng {reg_txt}: Đề nghị làm men tim (hs-Troponin) và siêu âm tim")
+    elif len(coronary_res["ischemia_leads"]) >= 2:
+        findings.append(("Bệnh mạch vành", f"Thiếu máu cục bộ cơ tim (ST chênh xuống / T âm) tại các chuyển đạo: {', '.join(coronary_res['ischemia_leads'])}"))
+
+    # Ưu tiên 3: Sẹo hoại tử / Nhồi máu cơ tim cũ (Chỉ kết luận khi có vùng liên tiếp thực thụ)
+    elif coronary_res["old_mi_regions"]:
+        findings.append(("Hội chứng vành mạn (CCS)", f"Sẹo hoại tử / Nhồi máu cơ tim cũ (Old MI) - Vùng: {', '.join(coronary_res['old_mi_regions'])}"))
 
     # 5. Dày thất & Lớn nhĩ
     v1_data = leads.get("V1", {})
@@ -444,7 +468,7 @@ with col1:
 with col2:
     st.subheader("2. Kết Quả Chẩn Đoán Chuyên Khoa")
     if uploaded:
-        with st.spinner("Đang bóc tách nét vẽ đa phổ màu, quét điểm J và đối chiếu tiêu chuẩn STEMI..."):
+        with st.spinner("Đang loại trừ sóng Q sinh lý, phân tích ST-T và đối chiếu vùng thiếu máu cục bộ..."):
             res = process_ecg_dataset(img_pil)
             diag = diagnose_ecg_comprehensive(res, gender=gender_choice, age=age_choice)
 
@@ -468,32 +492,36 @@ with col2:
         st.markdown("#### Kết Luận Chẩn Đoán Phân Tầng")
         if diag["findings"]:
             for cat, desc in diag["findings"]:
-                if "STEMI" in desc or "độ III" in desc or "CẤP" in desc:
+                if "STEMI" in desc or "độ III" in desc:
                     st.markdown(f"- **[{cat}]** :red[{desc}]")
-                elif "Block" in desc or "Dày thất" in desc or "Thiếu máu" in desc:
+                elif "Thiếu máu" in desc or "Block" in desc or "Dày thất" in desc or "mạn" in desc:
                     st.markdown(f"- **[{cat}]** :orange[{desc}]")
                 else:
                     st.markdown(f"- **[{cat}]** :green[{desc}]")
         else:
-            st.success("✅ Bản ghi bình thường, không phát hiện nhồi máu cơ tim cấp hoặc rối loạn dẫn truyền.")
+            st.success("✅ Bản ghi bình thường, không phát hiện thiếu máu cơ tim cấp/mạn hoặc rối loạn dẫn truyền.")
 
         st.markdown("---")
-        with st.expander("🔍 Chi Tiết Độ Chênh ST & Sóng R Từng Chuyển Đạo"):
+        with st.expander("🔍 Chi Tiết Đo Đạc ST, Sóng T & Sóng Q Từng Chuyển Đạo"):
             detail_list = []
             for l_name, l_data in res["leads"].items():
                 st_shift_val = l_data.get('st_shift', 0.0)
+                t_amp_val = l_data.get('t_amp', 0.0)
+                q_dur_val = l_data.get('q_dur', 0.0)
+                q_amp_val = l_data.get('q_amp', 0.0)
+
                 st_eval = "Đẳng điện"
                 if st_shift_val >= 1.0:
                     st_eval = "🔴 ST Chênh Lên"
-                elif st_shift_val <= -0.75:
+                elif st_shift_val <= -0.5:
                     st_eval = "🔵 ST Chênh Xuống"
 
                 detail_list.append({
                     "Chuyển đạo": l_name,
                     "ST Chênh (mm)": f"{st_shift_val:+.1f}",
+                    "Sóng T (mm)": f"{t_amp_val:+.1f}",
                     "Đánh giá ST": st_eval,
-                    "R (mm)": f"{l_data.get('r_amp', 0.0):.1f}",
-                    "S (mm)": f"{l_data.get('s_amp', 0.0):.1f}"
+                    "Sóng Q (mm/s)": f"{q_amp_val:.1f}mm / {q_dur_val:.3f}s"
                 })
             st.dataframe(detail_list, use_container_width=True, height=260)
     else:
