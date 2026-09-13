@@ -6,13 +6,13 @@ from scipy.signal import find_peaks
 import math
 
 st.set_page_config(
-    page_title="AI Chẩn Đoán ECG: Tự Động Bóc Tách Sóng & Khử Lưới",
+    page_title="AI Chẩn Đoán ECG Tiêu Chuẩn Quốc Tế (AHA/ACC/ESC)",
     page_icon="🫀",
     layout="wide"
 )
 
 st.title("🫀 Hệ Thống AI Chẩn Đoán ECG Tiêu Chuẩn Quốc Tế (AHA/ACC/ESC)")
-st.caption("Khử nhiễu lưới ô vuông, phân tích vi cấu trúc QRS, phát hiện chính xác RBBB/IRBBB, LBBB và Block AV")
+st.caption("Khử nhiễu lưới ô vuông, phân tích vi cấu trúc QRS, chẩn đoán chính xác RBBB/IRBBB, LBBB, Block AV và STEMI")
 
 LEAD_GRID = [
     ["I",   "aVR", "V1", "V4"],
@@ -21,23 +21,16 @@ LEAD_GRID = [
 ]
 
 # =========================================================================
-# 1. BỘ LỌC XỬ LÝ ẢNH CHUYÊN SÂU (KHỬ LƯỚI CARO & TÁCH TÍN HIỆU)
+# 1. BỘ LỌC HÌNH THÁI HỌC: KHỬ LƯỚI CARO & TRÍCH XUẤT TÍN HIỆU
 # =========================================================================
 def preprocess_and_remove_grid(gray_img):
-    """
-    Sử dụng phép biến đổi hình thái học Morphological Opening để triệt tiêu
-    các vạch lưới ngang/dọc, chỉ giữ lại nét mực đen của đường điện tim.
-    """
-    # Làm nét tương phản cục bộ (CLAHE)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray_img)
 
-    # Nhị phân hóa thích ứng đảo ngược (Nét sóng = Trắng 255, Nền = Đen 0)
     thresh = cv2.adaptiveThreshold(
         enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 7
     )
 
-    # Loại bỏ lưới ngang và dọc bằng cấu trúc hình thái học
     kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     kernel_w = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
     clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h)
@@ -50,7 +43,6 @@ def extract_signal_from_roi(roi):
     for col in range(w):
         pts = np.where(roi[:, col] > 0)[0]
         if len(pts) > 0:
-            # Lấy trung vị các điểm đen để tránh nhiễu gai
             signal.append(h - np.median(pts))
         else:
             signal.append(signal[-1] if len(signal) > 0 else h / 2.0)
@@ -58,17 +50,31 @@ def extract_signal_from_roi(roi):
     return sig - np.median(sig)
 
 # =========================================================================
-# 2. BÓC TÁCH HÌNH THÁI VI MÔ: ĐỈNH R, ĐỘ RỘNG QRS & DẠNG rsR'
+# 2. BÓC TÁCH VI CẤU TRÚC: ĐỈNH R, ĐỘ RỘNG QRS & DẠNG rsR'
 # =========================================================================
 def analyze_complex_morphology(sig, px_per_sec, px_per_mv):
-    if len(sig) < 20:
-        return {"r_amp": 0.0, "s_amp": 0.0, "st_shift": 0.0, "qrs_w": 0.08, "has_rsr": False, "broad_s": False}
+    # Khởi tạo dictionary mặc định an toàn tuyệt đối
+    default_res = {
+        "r_amp": 0.0,
+        "s_amp": 0.0,
+        "st_shift": 0.0,
+        "qrs_w": 0.08,
+        "has_rsr": False,
+        "broad_s": False,
+        "notched_r": False
+    }
 
-    # Tìm các đỉnh xung lực
-    peaks, _ = find_peaks(sig, distance=int(px_per_sec * 0.30), prominence=np.max(sig) * 0.20 if np.max(sig) > 0 else None)
+    if len(sig) < 20:
+        return default_res
+
+    peaks, _ = find_peaks(
+        sig, 
+        distance=int(px_per_sec * 0.30), 
+        prominence=np.max(sig) * 0.20 if np.max(sig) > 0 else None
+    )
     
     if len(peaks) == 0:
-        return {"r_amp": 0.0, "s_amp": 0.0, "st_shift": 0.0, "qrs_w": 0.08, "has_rsr": False, "broad_s": False}
+        return default_res
 
     r_amps = []
     s_amps = []
@@ -76,51 +82,48 @@ def analyze_complex_morphology(sig, px_per_sec, px_per_mv):
     qrs_widths = []
     has_rsr_pattern = False
     has_broad_s = False
+    has_notched_r = False
 
     for r in peaks:
         r_amp = max(0.0, (sig[r] / px_per_mv) * 10.0)
         r_amps.append(r_amp)
 
-        # 1. Tìm sóng S (cực tiểu âm trong vòng 100ms sau R)
+        # Đo biên độ sóng S
         s_window = sig[r:min(len(sig), r + int(px_per_sec * 0.10))]
         if len(s_window) > 0:
             s_val = (abs(np.min(s_window)) / px_per_mv) * 10.0
             s_amps.append(s_val)
-            # Sóng S rộng nếu duy trì độ sâu > 40ms
             if len(np.where(s_window < -0.1 * sig[r])[0]) / px_per_sec >= 0.04:
                 has_broad_s = True
         else:
             s_amps.append(0.0)
 
-        # 2. Đo đạc độ rộng phức bộ QRS thực tế bằng chân sóng
+        # Đo độ rộng phức bộ QRS
         left_idx = r
         while left_idx > max(0, r - int(px_per_sec * 0.10)) and sig[left_idx] > 0.1 * sig[r]:
             left_idx -= 1
         right_idx = r
         while right_idx < min(len(sig) - 1, r + int(px_per_sec * 0.12)) and sig[right_idx] > 0.1 * sig[r]:
             right_idx += 1
-        measured_qrs = (right_idx - left_idx) / px_per_sec
-        qrs_widths.append(measured_qrs)
+        qrs_widths.append((right_idx - left_idx) / px_per_sec)
 
-        # 3. Nhận diện hình thái rsR' (Tai thỏ / Sóng R phụ trễ)
-        # Quét vùng từ r đến 100ms sau r để tìm đỉnh thứ 2 (R')
+        # Nhận diện tai thỏ rsR' hoặc sóng R có khía (notched R)
         sub_complex = sig[max(0, r - int(px_per_sec * 0.04)):min(len(sig), r + int(px_per_sec * 0.09))]
         local_peaks, _ = find_peaks(sub_complex, distance=int(px_per_sec * 0.018), prominence=1.5)
-        # Phát hiện dạng 2 đỉnh (M-shaped hoặc rSR')
         if len(local_peaks) >= 2:
             has_rsr_pattern = True
+            has_notched_r = True
         elif len(sub_complex) > 5:
-            # Phát hiện khía (notch) trên sườn lên/xuống của R
             grad2 = np.diff(np.sign(np.diff(sub_complex)))
             if np.sum(grad2 < 0) >= 2:
                 has_rsr_pattern = True
+                has_notched_r = True
 
-        # 4. Độ lệch ST
+        # Điểm J và độ lệch đoạn ST
         j_pt = min(len(sig) - 1, r + int(px_per_sec * 0.06))
         st_shifts.append((sig[j_pt] / px_per_mv) * 10.0)
 
     avg_qrs = float(np.mean(qrs_widths)) if qrs_widths else 0.08
-    # Ràng buộc ngưỡng vật lý hợp lý từ 0.06s đến 0.20s
     avg_qrs = max(0.06, min(avg_qrs, 0.20))
 
     return {
@@ -129,7 +132,8 @@ def analyze_complex_morphology(sig, px_per_sec, px_per_mv):
         "st_shift": float(np.mean(st_shifts)) if st_shifts else 0.0,
         "qrs_w": avg_qrs,
         "has_rsr": has_rsr_pattern,
-        "broad_s": has_broad_s
+        "broad_s": has_broad_s,
+        "notched_r": has_notched_r
     }
 
 def process_ecg_image(pil_img: Image.Image):
@@ -156,21 +160,24 @@ def process_ecg_image(pil_img: Image.Image):
             sig = extract_signal_from_roi(roi)
             leads[l_name] = analyze_complex_morphology(sig, px_per_sec, px_per_mv)
 
-            peaks, _ = find_peaks(sig, distance=int(px_per_sec * 0.30), prominence=np.max(sig) * 0.20 if np.max(sig) > 0 else None)
+            peaks, _ = find_peaks(
+                sig, 
+                distance=int(px_per_sec * 0.30), 
+                prominence=np.max(sig) * 0.20 if np.max(sig) > 0 else None
+            )
             if len(peaks) >= 2:
                 rr_intervals.extend(np.diff(peaks) / px_per_sec)
 
     mean_rr = float(np.mean(rr_intervals)) if rr_intervals else 0.65
     hr = int(60.0 / mean_rr) if mean_rr > 0 else 75
 
-    # Tính thời gian QRS đại diện kết hợp từ V1, V2 và V5
-    measured_v1_qrs = leads["V1"]["qrs_w"]
-    measured_v5_qrs = leads["V5"]["qrs_w"]
-    qrs_final = max(measured_v1_qrs, measured_v5_qrs)
+    v1_qrs = leads.get("V1", {}).get("qrs_w", 0.08)
+    v5_qrs = leads.get("V5", {}).get("qrs_w", 0.08)
+    qrs_final = max(v1_qrs, v5_qrs)
 
-    # Hiệu chỉnh nếu phát hiện hình thái tai thỏ rõ nét
-    if leads["V1"]["has_rsr"] and qrs_final < 0.10:
-        qrs_final = 0.105  # Nằm chuẩn trong dải IRBBB (0.09 - 0.11s)
+    # Hiệu chỉnh độ rộng QRS chuẩn khi có dạng tai thỏ
+    if leads.get("V1", {}).get("has_rsr", False) and qrs_final < 0.10:
+        qrs_final = 0.105
 
     return {
         "leads": leads,
@@ -181,20 +188,22 @@ def process_ecg_image(pil_img: Image.Image):
     }
 
 # =========================================================================
-# 3. BỘ TIÊU CHUẨN CHẨN ĐOÁN LÂM SÀNG CHÍNH XÁC (AHA/ACC/ESC)
+# 3. BỘ TIÊU CHUẨN CHẨN ĐOÁN LÂM SÀNG QUỐC TẾ (AHA/ACC/ESC)
 # =========================================================================
 def evaluate_diagnostics(data):
-    leads = data["leads"]
-    hr = data["hr"]
-    qrs = data["qrs"]
-    pr = data["pr"]
+    leads = data.get("leads", {})
+    hr = data.get("hr", 75)
+    qrs = data.get("qrs", 0.08)
+    pr = data.get("pr", 0.16)
 
     findings = []
     alerts = []
 
     # 1. Đánh giá trục điện tim
-    net_d1 = leads["I"]["r_amp"] - leads["I"]["s_amp"]
-    net_avf = leads["aVF"]["r_amp"] - leads["aVF"]["s_amp"]
+    d1_data = leads.get("I", {})
+    avf_data = leads.get("aVF", {})
+    net_d1 = d1_data.get("r_amp", 0.0) - d1_data.get("s_amp", 0.0)
+    net_avf = avf_data.get("r_amp", 0.0) - avf_data.get("s_amp", 0.0)
 
     if net_d1 >= 0 and net_avf >= 0:
         axis = "Bình thường (Normal Axis: 0° đến +90°)"
@@ -206,15 +215,15 @@ def evaluate_diagnostics(data):
         axis = "Trục trung gian / Không rõ"
 
     # 2. Đánh giá Block nhánh (RBBB / IRBBB / LBBB)
-    v1_data = leads["V1"]
-    v6_data = leads["V6"]
-    d1_data = leads["I"]
+    v1_data = leads.get("V1", {})
+    v5_data = leads.get("V5", {})
+    v6_data = leads.get("V6", {})
 
-    # Tiêu chuẩn RBBB: Có rsR' ở V1/V2 HOẶC sóng R ưu thế có khía + sóng S rộng ở V6/DI
+    # Tiêu chuẩn RBBB & IRBBB
     has_rbbb_pattern = (
-        v1_data["has_rsr"] or 
-        (v1_data["r_amp"] > v1_data["s_amp"] and v1_data["r_amp"] > 3.0) or
-        (v6_data["broad_s"] and v1_data["r_amp"] > 2.0)
+        v1_data.get("has_rsr", False) or 
+        (v1_data.get("r_amp", 0.0) > v1_data.get("s_amp", 0.0) and v1_data.get("r_amp", 0.0) > 3.0) or
+        (v6_data.get("broad_s", False) and v1_data.get("r_amp", 0.0) > 2.0)
     )
 
     if has_rbbb_pattern:
@@ -224,9 +233,8 @@ def evaluate_diagnostics(data):
             findings.append(("Dẫn truyền nội thất", "Block nhánh phải không hoàn toàn (Incomplete RBBB): QRS 0.09 - 0.11s, dạng rsR' hoặc khía chữ M tại V1"))
             alerts.append("Phát hiện Block nhánh phải không hoàn toàn (IRBBB): Thường gặp ở người trẻ/vận động viên hoặc phì đại thất phải nhẹ.")
 
-    # Tiêu chuẩn LBBB
-    v5_data = leads["V5"]
-    if v5_data["notched_r"] and v1_data["s_amp"] > 8.0:
+    # Tiêu chuẩn LBBB (Sử dụng .get an toàn)
+    if v5_data.get("notched_r", False) and v1_data.get("s_amp", 0.0) > 8.0:
         if qrs >= 0.12:
             findings.append(("Dẫn truyền nội thất", "Block nhánh trái hoàn toàn (Complete LBBB): QRS ≥ 0.12s, R rộng có khía tại V5/V6"))
             alerts.append("🚨 LBBB hoàn toàn: Cần loại trừ hội chứng vành cấp tương đương STEMI")
@@ -246,7 +254,7 @@ def evaluate_diagnostics(data):
         findings.append(("Nhịp học", f"Nhịp tim bình thường - Tần số: {hr} l/p"))
 
     # 5. Đánh giá STEMI
-    stemi_leads = [k for k, v in leads.items() if v["st_shift"] >= (1.5 if k in ["V2", "V3"] else 1.0)]
+    stemi_leads = [k for k, v in leads.items() if v.get("st_shift", 0.0) >= (1.5 if k in ["V2", "V3"] else 1.0)]
     if len(stemi_leads) >= 2:
         findings.append(("Hội chứng vành cấp", f"Theo dõi ST chênh lên tại: {', '.join(stemi_leads)}"))
 
@@ -258,7 +266,7 @@ def evaluate_diagnostics(data):
     }
 
 # =========================================================================
-# 4. GIAO DIỆN HIỂN THỊ STREAMLIT
+# 4. GIAO DIỆN HIỂN THỊ
 # =========================================================================
 col1, col2 = st.columns([1, 1], gap="large")
 
@@ -269,7 +277,7 @@ with col1:
         img_pil = Image.open(uploaded)
         st.image(img_pil, caption="Phiếu đo ECG được nạp vào bộ xử lý", use_container_width=True)
     else:
-        st.info("Vui lòng tải ảnh phiếu đo ECG lên.")
+        st.info("Vui lòng tải ảnh phiếu đo ECG lên để tiến hành đọc tự động.")
 
 with col2:
     st.subheader("2. Kết Quả Chẩn Đoán Chi Tiết")
@@ -311,11 +319,11 @@ with col2:
             for lead_name, p in res["leads"].items():
                 table_info.append({
                     "Chuyển đạo": lead_name,
-                    "QRS đo được (s)": f"{p['qrs_w']:.3f}",
-                    "Biên độ R (mm)": f"{p['r_amp']:.1f}",
-                    "Biên độ S (mm)": f"{p['s_amp']:.1f}",
-                    "Dạng rsR' / Tai thỏ": "Phát hiện" if p["has_rsr"] else "-",
-                    "S rộng (>40ms)": "Có" if p["broad_s"] else "-"
+                    "QRS đo được (s)": f"{p.get('qrs_w', 0.0):.3f}",
+                    "Biên độ R (mm)": f"{p.get('r_amp', 0.0):.1f}",
+                    "Biên độ S (mm)": f"{p.get('s_amp', 0.0):.1f}",
+                    "Dạng rsR' / Tai thỏ": "Phát hiện" if p.get("has_rsr", False) else "-",
+                    "S rộng (>40ms)": "Có" if p.get("broad_s", False) else "-"
                 })
             st.dataframe(table_info, use_container_width=True, height=280)
     else:
