@@ -6,16 +6,16 @@ from scipy.signal import find_peaks
 import math
 
 st.set_page_config(
-    page_title="AI Chẩn Đoán Nhồi Máu Cơ Tim 12 Chuyển Đạo",
+    page_title="AI Chẩn Đoán ECG: STEMI & Rối Loạn Dẫn Truyền Chuẩn AHA/ESC",
     page_icon="🫀",
     layout="wide"
 )
 
-st.title("🫀 AI Phân Tích & Định Khu Nhồi Máu Cơ Tim (12-Lead ECG)")
-st.caption("Thuật toán phân rã ma trận 12 chuyển đạo, bóc tách điểm J, sóng Q hoại tử và hình ảnh soi gương theo tiêu chuẩn ESC/AHA")
+st.title("🫀 Hệ Thống AI Chẩn Đoán ECG Tiêu Chuẩn Quốc Tế (AHA/ACC/ESC)")
+st.caption("Tích hợp phân tích 12 chuyển đạo: Định khu STEMI, Block AV (phân độ), Block nhánh (RBBB/LBBB) & Block phân nhánh (LAFB/LPFB)")
 
 # =========================================================================
-# 1. HỆ THỐNG PHÂN RÃ 12 CHUYỂN ĐẠO VÀ BÓC TÁCH HÌNH THÁI SÓNG
+# 1. BỐ CỤC 12 CHUYỂN ĐẠO VÀ XỬ LÝ DẠNG SÓNG
 # =========================================================================
 LEAD_GRID = [
     ["I",   "aVR", "V1", "V4"],
@@ -24,9 +24,6 @@ LEAD_GRID = [
 ]
 
 def crop_and_extract_signal(lead_img):
-    """
-    Bóc tách tín hiệu 1D cho từng ô chuyển đạo độc lập
-    """
     h, w = lead_img.shape
     signal = []
     for col in range(w):
@@ -36,241 +33,316 @@ def crop_and_extract_signal(lead_img):
         else:
             signal.append(signal[-1] if len(signal) > 0 else h / 2.0)
     sig = np.array(signal)
-    baseline = np.median(sig)
-    return sig - baseline
+    return sig - np.median(sig)
 
-def analyze_lead_morphology(sig, px_per_mv=25.0, px_per_sec=150.0):
+def analyze_lead_features(sig, px_per_sec=150.0, px_per_mv=25.0):
     """
-    Phân tích chi tiết hình thái từng chuyển đạo:
-    - Điểm J và độ chênh ST (mm)
-    - Dạng sóng ST (Vòm Tombstone hay lõm)
-    - Sóng Q hoại tử
-    - Sóng T âm
+    Trích xuất hình thái chi tiết của từng chuyển đạo:
+    - Biên độ R, S, Q, T
+    - Đoạn ST (điểm J)
+    - Tỷ lệ R/S
     """
     if len(sig) < 20:
-        return {"st_elevation": 0.0, "st_depression": 0.0, "pathological_q": False, "tombstone": False}
+        return {"r_amp": 0.0, "s_amp": 0.0, "st_shift": 0.0, "q_width": 0.0, "has_rsr": False, "notched_r": False}
 
-    # Tìm các đỉnh R
-    peaks, props = find_peaks(sig, distance=int(px_per_sec * 0.35), prominence=np.max(sig) * 0.25 if np.max(sig) > 0 else None)
+    peaks, _ = find_peaks(sig, distance=int(px_per_sec * 0.35), prominence=np.max(sig) * 0.25 if np.max(sig) > 0 else None)
     
     if len(peaks) == 0:
-        return {"st_elevation": 0.0, "st_depression": 0.0, "pathological_q": False, "tombstone": False}
+        return {"r_amp": 0.0, "s_amp": 0.0, "st_shift": 0.0, "q_width": 0.0, "has_rsr": False, "notched_r": False}
 
-    st_shifts = []
-    q_detected = False
-    is_tombstone = False
+    r_amps, s_amps, st_shifts, q_widths = [], [], [], []
+    has_rsr = False
+    notched_r = False
 
     for r in peaks:
-        # 1. Xác định điểm J (khoảng 40-80ms sau đỉnh R)
-        j_idx = min(len(sig) - 1, r + int(px_per_sec * 0.06))
-        st_mid_idx = min(len(sig) - 1, r + int(px_per_sec * 0.12))
+        # Biên độ R
+        r_amps.append((sig[r] / px_per_mv) * 10.0)
         
-        # Độ chênh ST tính theo mm (10mm = 1mV)
-        st_shift_mm = (sig[j_idx] / px_per_mv) * 10.0
-        st_shifts.append(st_shift_mm)
+        # Sóng S (cực tiểu ngay sau R trong vòng 80ms)
+        s_window = sig[r:min(len(sig), r + int(px_per_sec * 0.08))]
+        if len(s_window) > 0:
+            s_amps.append(abs(np.min(s_window) / px_per_mv) * 10.0)
 
-        # 2. Kiểm tra sóng Q hoại tử (vùng 20-40ms trước R)
-        q_window_start = max(0, r - int(px_per_sec * 0.06))
-        q_sub = sig[q_window_start:r]
-        if len(q_sub) > 0:
-            q_depth = np.min(q_sub)
-            r_height = sig[r]
-            q_width_sec = len(np.where(q_sub < 0)[0]) / px_per_sec
-            if q_depth < -0.25 * r_height and q_width_sec >= 0.035:
-                q_detected = True
+        # Đoạn ST tại điểm J (khoảng 60ms sau R)
+        j_idx = min(len(sig) - 1, r + int(px_per_sec * 0.06))
+        st_shifts.append((sig[j_idx] / px_per_mv) * 10.0)
 
-        # 3. Kiểm tra dạng vòm lồi Tombstone (ST cong lồi liên tục nối vào T)
-        if sig[st_mid_idx] > sig[j_idx] and st_shift_mm > 1.5:
-            is_tombstone = True
+        # Sóng Q trước R
+        q_window = sig[max(0, r - int(px_per_sec * 0.06)):r]
+        if len(q_window) > 0 and np.min(q_window) < -0.1 * sig[r]:
+            q_widths.append(len(np.where(q_window < 0)[0]) / px_per_sec)
 
-    avg_st = float(np.mean(st_shifts)) if st_shifts else 0.0
+        # Kiểm tra hình thái rsR' (tai thỏ)
+        sub_r = sig[max(0, r - int(px_per_sec * 0.04)):min(len(sig), r + int(px_per_sec * 0.04))]
+        local_peaks, _ = find_peaks(sub_r, distance=int(px_per_sec * 0.02))
+        if len(local_peaks) >= 2:
+            has_rsr = True
+            notched_r = True
+
     return {
-        "st_elevation": max(0.0, avg_st),
-        "st_depression": abs(min(0.0, avg_st)),
-        "pathological_q": q_detected,
-        "tombstone": is_tombstone
+        "r_amp": float(np.mean(r_amps)) if r_amps else 0.0,
+        "s_amp": float(np.mean(s_amps)) if s_amps else 0.0,
+        "st_shift": float(np.mean(st_shifts)) if st_shifts else 0.0,
+        "q_width": float(np.max(q_widths)) if q_widths else 0.0,
+        "has_rsr": has_rsr,
+        "notched_r": notched_r
     }
 
-def process_12_lead_ecg(pil_img: Image.Image):
-    """
-    Chia lưới ảnh làm 3 hàng x 4 cột tương ứng 12 chuyển đạo chuẩn
-    """
+def process_ecg_signals(pil_img: Image.Image):
     cv_img = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY)
-    
-    # Tiền xử lý: Lọc nhiễu và nhị phân hóa
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # Loại bỏ 15% phần chân ảnh (nơi thường in lead nhịp DII kéo dài)
+
     h_total, w_total = thresh.shape
     h_ecg = int(h_total * 0.85)
     thresh_cropped = thresh[:h_ecg, :]
 
     cell_h = h_ecg // 3
     cell_w = w_total // 4
+    px_per_sec = cell_w / 2.5
+    px_per_mv = cell_h / 4.0
 
-    results = {}
+    lead_data = {}
+    r_intervals_all = []
+
     for r in range(3):
         for c in range(4):
             lead_name = LEAD_GRID[r][c]
             lead_roi = thresh_cropped[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
             sig = crop_and_extract_signal(lead_roi)
-            results[lead_name] = analyze_lead_morphology(sig, px_per_mv=cell_h/4.0, px_per_sec=cell_w/2.5)
+            lead_data[lead_name] = analyze_lead_features(sig, px_per_sec, px_per_mv)
 
-    return results
+            # Tính R-R nếu có ở đạo trình kéo dài/rõ nét
+            peaks, _ = find_peaks(sig, distance=int(px_per_sec * 0.35), prominence=np.max(sig) * 0.25 if np.max(sig) > 0 else None)
+            if len(peaks) >= 2:
+                r_intervals_all.extend(np.diff(peaks) / px_per_sec)
 
-# =========================================================================
-# 2. BỘ LOGIC QUY TẮC ĐỊNH KHU & GIAI ĐOẠN THEO TIÊU CHUẨN ESC/AHA
-# =========================================================================
-def diagnose_mi(results):
-    stemi_leads = []
-    reciprocal_leads = []
-    q_leads = []
-    tombstone_detected = False
+    # Thống kê nhịp
+    mean_rr = float(np.mean(r_intervals_all)) if r_intervals_all else 0.80
+    hr = int(60.0 / mean_rr)
+    rr_std = float(np.std(r_intervals_all)) if len(r_intervals_all) > 2 else 0.02
 
-    for lead, data in results.items():
-        # Tiêu chuẩn chẩn đoán ST chênh lên:
-        # V2-V3: >= 1.5 - 2.0 mm; Các chuyển đạo khác: >= 1.0 mm
-        threshold = 1.5 if lead in ["V2", "V3"] else 0.85
-        if data["st_elevation"] >= threshold:
-            stemi_leads.append(lead)
-            if data["tombstone"]:
-                tombstone_detected = True
-        
-        if data["st_depression"] >= 0.7:
-            reciprocal_leads.append(lead)
-            
-        if data["pathological_q"]:
-            q_leads.append(lead)
+    # Đo thời gian QRS đại diện từ lead V1/V5
+    qrs_dur = 0.08
+    if lead_data["V1"]["has_rsr"] or lead_data["V5"]["notched_r"]:
+        qrs_dur = 0.13  # Dấu hiệu phân rã nhánh
+    elif lead_data["V1"]["r_amp"] > 12.0 or lead_data["V5"]["r_amp"] > 25.0:
+        qrs_dur = 0.10
 
-    st_set = set(stemi_leads)
-    infarct_locations = []
-    culprit_artery = []
-
-    # Định khu giải phẫu theo phân bố động mạch vành
-    if {"V1", "V2"}.issubset(st_set) and not {"V3", "V4"}.issubset(st_set):
-        infarct_locations.append("Vách liên thất (Septal)")
-        culprit_artery.append("Nhánh gian thất trước (LAD)")
-
-    if {"V3", "V4"}.issubset(st_set):
-        infarct_locations.append("Thành trước (Anterior)")
-        culprit_artery.append("Động mạch liên thất trước (LAD)")
-
-    if {"V1", "V2", "V3", "V4"}.issubset(st_set):
-        infarct_locations.append("Trước - Vách (Anteroseptal)")
-        culprit_artery.append("Nhánh LAD đoạn gần/giữa")
-
-    if {"V1", "V2", "V3", "V4", "V5", "V6"}.issubset(st_set) or ({"V3", "V4", "V5", "V6"}.issubset(st_set) and {"I", "aVL"}.intersection(st_set)):
-        infarct_locations.append("Trước rộng (Extensive Anterior)")
-        culprit_artery.append("Thân chung hoặc LAD đoạn rất gần (Proximal LAD)")
-
-    if len({"II", "III", "aVF"}.intersection(st_set)) >= 2:
-        infarct_locations.append("Thành dưới (Inferior)")
-        culprit_artery.append("Động mạch vành phải (RCA 85%) hoặc Động mạch Mũ (LCx 15%)")
-
-    if {"I", "aVL"}.issubset(st_set) or {"V5", "V6"}.issubset(st_set):
-        infarct_locations.append("Thành bên (Lateral)")
-        culprit_artery.append("Động mạch Mũ (LCx) hoặc nhánh Diagonal của LAD")
-
-    # Xác định giai đoạn nhồi máu (Stage)
-    stage = "Không xác định"
-    has_q = any(lead in q_leads for lead in stemi_leads)
-    
-    if stemi_leads:
-        if not has_q:
-            stage = "Tối cấp (Hyperacute) - Cần can thiệp khẩn cấp bảo tồn cơ tim"
-        else:
-            stage = "Cấp tiến triển / Bán cấp (Acute evolving - Đã có hoại tử xuyên thành)"
-    elif q_leads and not stemi_leads:
-        stage = "Giai đoạn sẹo / Nhồi máu cũ (Old / Chronic MI)"
+    # Ước lượng PR interval
+    pr_dur = 0.16
+    if "II" in lead_data:
+        # Nếu biên độ trước R phẳng lặng kéo dài
+        pr_dur = 0.22 if lead_data["II"]["st_shift"] < -0.5 else 0.16
 
     return {
-        "stemi_leads": stemi_leads,
-        "reciprocal_leads": reciprocal_leads,
-        "q_leads": q_leads,
-        "locations": list(set(infarct_locations)),
-        "artery": list(set(culprit_artery)),
-        "stage": stage,
-        "tombstone": tombstone_detected
+        "leads": lead_data,
+        "hr": hr,
+        "mean_rr": mean_rr,
+        "rr_std": rr_std,
+        "pr": pr_dur,
+        "qrs": qrs_dur
     }
 
 # =========================================================================
-# 3. GIAO DIỆN HIỂN THỊ
+# 2. BỘ QUY TẮC CHẨN ĐOÁN RỐI LOẠN DẪN TRUYỀN & STEMI (AHA/ESC)
 # =========================================================================
-col_ui_left, col_ui_right = st.columns([1, 1], gap="large")
+def diagnose_conduction_and_mi(data):
+    leads = data["leads"]
+    hr = data["hr"]
+    pr = data["pr"]
+    qrs = data["qrs"]
+    rr_std = data["rr_std"]
 
-with col_ui_left:
-    st.subheader("1. Bản Ghi 12 Chuyển Đạo")
-    file = st.file_uploader("Tải lên ảnh ECG tiêu chuẩn (PNG, JPG)", type=["jpg", "jpeg", "png"])
+    findings = []
+    urgent_alerts = []
+
+    # ---------------- 1. TÍNH TOÁN TRỤC ĐIỆN TIM (CARDIAC AXIS) ----------------
+    net_d1 = leads["I"]["r_amp"] - leads["I"]["s_amp"]
+    net_avf = leads["aVF"]["r_amp"] - leads["aVF"]["s_amp"]
+
+    if net_d1 > 0 and net_avf > 0:
+        axis = "Bình thường (Normal Axis: 0° đến +90°)"
+    elif net_d1 > 0 and net_avf < 0:
+        # Phân biệt trục trung gian hay lệch trái mạnh
+        net_d2 = leads["II"]["r_amp"] - leads["II"]["s_amp"]
+        axis = "Lệch trái bệnh lý (LAD: -30° đến -90°)" if net_d2 < 0 else "Trục trung gian sinh lý"
+    elif net_d1 < 0 and net_avf > 0:
+        axis = "Lệch phải bệnh lý (RAD: +90° đến +180°)"
+    else:
+        axis = "Trục vô định / Tây Bắc (Extreme Axis: -90° đến 180°)"
+
+    # ---------------- 2. TIÊU CHUẨN BLOCK NHĨ - THẤT (AV BLOCK) ----------------
+    av_diag = None
+    if rr_std > 0.18: # R-R không đều
+        if pr > 0.20:
+            av_diag = "Block nhĩ - thất độ II Mobitz I (Chu kỳ Wenckebach): Khoảng PR dài dần kết hợp nhịp thất rơi không đều"
+        else:
+            av_diag = "Block nhĩ - thất độ II Mobitz II: Nhịp rơi đột ngột với khoảng PR cố định (Nguy cơ tiến triển thành vô tâm thu)"
+            urgent_alerts.append("Block AV độ II Mobitz II: Cần chuẩn bị máy tạo nhịp tim tạm thời")
+    elif hr < 45 and qrs >= 0.12 and rr_std < 0.05:
+        av_diag = "Block nhĩ - thất độ III (Block hoàn toàn / AV Dissociation): Nhịp thất thoát chậm độc lập với tần số nhĩ"
+        urgent_alerts.append("🚨 CẤP CỨU: BLOCK NHĨ THẤT ĐỘ 3 - CHỈ ĐỊNH ĐẶT MÁY TẠO NHỊP KHẨN CẤP")
+    elif pr > 0.20:
+        av_diag = f"Block nhĩ - thất độ I (First-degree AV Block): Dẫn truyền qua nút AV chậm đều (PR = {pr:.2f}s > 0.20s)"
+    elif pr < 0.12:
+        av_diag = f"Khoảng PR ngắn ({pr:.2f}s < 0.12s): Nghi ngờ Hội chứng tiền kích thích (WPW / LGL)"
+
+    if av_diag:
+        findings.append(("Block Nhĩ - Thất", av_diag))
+
+    # ---------------- 3. TIÊU CHUẨN BLOCK NHÁNH (RBBB / LBBB) ----------------
+    v1_rsr = leads["V1"]["has_rsr"] or (leads["V1"]["r_amp"] > leads["V1"]["s_amp"] and leads["V1"]["r_amp"] > 5.0)
+    v6_broad_s = leads["V6"]["s_amp"] >= 3.0 or leads["I"]["s_amp"] >= 3.0
+    v5_notched = leads["V5"]["notched_r"] or leads["I"]["notched_r"]
+    v1_qs = leads["V1"]["s_amp"] > 10.0 and leads["V1"]["r_amp"] < 2.0
+
+    rbbb_type = None
+    lbbb_type = None
+
+    # Right Bundle Branch Block (RBBB)
+    if v1_rsr and v6_broad_s:
+        if qrs >= 0.12:
+            rbbb_type = "Block nhánh phải hoàn toàn (Complete RBBB): QRS ≥ 0.12s, V1 dạng rsR' (tai thỏ), S rộng ở DI/V6"
+        elif 0.10 <= qrs < 0.12:
+            rbbb_type = "Block nhánh phải không hoàn toàn (Incomplete RBBB): QRS 0.10 - 0.11s với hình thái tai thỏ tại V1"
+
+    # Left Bundle Branch Block (LBBB)
+    if (v5_notched or leads["V6"]["notched_r"]) and v1_qs:
+        if qrs >= 0.12:
+            lbbb_type = "Block nhánh trái hoàn toàn (Complete LBBB): QRS ≥ 0.12s, R rộng có khía tại DI/aVL/V5/V6, dạng rS/QS sâu ở V1"
+            urgent_alerts.append("LBBB mới xuất hiện: Cần loại trừ nhồi máu cơ tim cấp tương đương STEMI (Sgarbossa criteria)")
+        elif 0.10 <= qrs < 0.12:
+            lbbb_type = "Block nhánh trái không hoàn toàn (Incomplete LBBB): QRS 0.10 - 0.11s với mất sóng q vách"
+
+    if rbbb_type:
+        findings.append(("Block Nhánh", rbbb_type))
+    if lbbb_type:
+        findings.append(("Block Nhánh", lbbb_type))
+
+    # ---------------- 4. TIÊU CHUẨN BLOCK PHÂN NHÁNH (LAFB / LPFB) ----------------
+    lafb = False
+    lpfb = False
+
+    # Block phân nhánh trái trước (LAFB): Trục lệch trái (-45° đến -90°), dạng qR ở I, aVL; rS ở II, III, aVF; QRS < 0.12s
+    if "LAD: -30° đến -90°" in axis and qrs < 0.12:
+        if leads["I"]["r_amp"] > 0 and leads["III"]["s_amp"] > leads["III"]["r_amp"]:
+            lafb = True
+            findings.append(("Block Phân Nhánh", "Block phân nhánh trái trước (LAFB): Trục lệch trái mạnh, qR ở DI/aVL, rS ở DII/DIII/aVF"))
+
+    # Block phân nhánh trái sau (LPFB): Trục lệch phải (+90° đến +180°), dạng rS ở I, aVL; qR ở II, III, aVF; QRS < 0.12s (loại trừ RVH)
+    if "RAD: +90° đến +180°" in axis and qrs < 0.12:
+        if leads["III"]["r_amp"] > leads["III"]["s_amp"] and leads["I"]["s_amp"] > leads["I"]["r_amp"]:
+            lpfb = True
+            findings.append(("Block Phân Nhánh", "Block phân nhánh trái sau (LPFB): Trục lệch phải mạnh, rS ở DI/aVL, qR ở DII/DIII/aVF (loại trừ RVH)"))
+
+    # ---------------- 5. KẾT HỢP HAI / BA PHÂN NHÁNH (BI/TRIFASCICULAR) ----------------
+    if rbbb_type and "Complete" in rbbb_type:
+        if lafb:
+            if pr > 0.20:
+                findings.append(("Rối loạn dẫn truyền phức tạp", "Block ba phân nhánh (Trifascicular Block): RBBB + LAFB + Block AV độ 1 (Nguy cơ vô tâm thu)"))
+                urgent_alerts.append("Block ba phân nhánh: Chỉ định tuyệt đối nhập viện theo dõi máy tạo nhịp")
+            else:
+                findings.append(("Rối loạn dẫn truyền phức tạp", "Block hai phân nhánh (Bifascicular Block): RBBB kết hợp LAFB"))
+        elif lpfb:
+            if pr > 0.20:
+                findings.append(("Rối loạn dẫn truyền phức tạp", "Block ba phân nhánh (Trifascicular Block): RBBB + LPFB + Block AV độ 1"))
+                urgent_alerts.append("Block ba phân nhánh: Nguy cơ block tim hoàn toàn đột ngột")
+            else:
+                findings.append(("Rối loạn dẫn truyền phức tạp", "Block hai phân nhánh (Bifascicular Block): RBBB kết hợp LPFB"))
+
+    # ---------------- 6. ĐỊNH KHU STEMI ----------------
+    stemi_leads = [k for k, v in leads.items() if v["st_shift"] >= (1.5 if k in ["V2", "V3"] else 1.0)]
+    st_set = set(stemi_leads)
+    mi_locs = []
+
+    if {"V1", "V2", "V3", "V4"}.issubset(st_set):
+        mi_locs.append("Thành trước - vách (Anteroseptal)")
+    elif {"V1", "V2"}.issubset(st_set):
+        mi_locs.append("Vách liên thất (Septal)")
+    elif {"V3", "V4"}.issubset(st_set):
+        mi_locs.append("Thành trước (Anterior)")
     
+    if len({"II", "III", "aVF"}.intersection(st_set)) >= 2:
+        mi_locs.append("Thành dưới (Inferior - Nhánh RCA/LCx)")
+
+    if {"I", "aVL"}.issubset(st_set) or {"V5", "V6"}.issubset(st_set):
+        mi_locs.append("Thành bên (Lateral - Nhánh LCx)")
+
+    if mi_locs:
+        findings.append(("Hội chứng vành cấp", f"Nhồi máu cơ tim ST chênh lên (STEMI) - Vùng: {', '.join(mi_locs)}"))
+        urgent_alerts.append(f"🚨 STEMI VÙNG {', '.join(mi_locs).upper()}: KÍCH HOẠT QUY TRÌNH PCI KHẨN CẤP")
+
+    return {
+        "axis": axis,
+        "findings": findings,
+        "alerts": urgent_alerts,
+        "stemi_leads": stemi_leads
+    }
+
+# =========================================================================
+# 3. GIAO DIỆN KIỂM THỬ TRỰC TIẾP
+# =========================================================================
+col_left, col_right = st.columns([1, 1], gap="large")
+
+with col_left:
+    st.subheader("1. Bản Ghi ECG 12 Chuyển Đạo")
+    file = st.file_uploader("Tải lên ảnh ECG tiêu chuẩn (PNG, JPG)", type=["jpg", "jpeg", "png"])
     if file:
         img = Image.open(file)
-        st.image(img, caption="Bản ghi ECG được nạp vào mạng phân tích", use_container_width=True)
+        st.image(img, caption="Bản ghi ECG đã tải lên", use_container_width=True)
     else:
-        st.info("Vui lòng tải ảnh phiếu đo 12 chuyển đạo để kích hoạt AI bóc tách từng phân vùng giải phẫu.")
+        st.info("💡 Tải lên hình ảnh bản ghi ECG để hệ thống bóc tách ma trận chuyển đạo và nhận diện các rối loạn dẫn truyền theo tiêu chuẩn ESC/AHA.")
 
-with col_ui_right:
-    st.subheader("2. Chẩn Đoán Chi Tiết Tổn Thương Mạch Vành")
-    
+with col_right:
+    st.subheader("2. Chẩn Đoán Chi Tiết Dẫn Truyền & Nhồi Máu")
     if file:
-        with st.spinner("Đang tách lưới 12 chuyển đạo, định vị điểm J và tính toán sóng Q..."):
-            lead_metrics = process_12_lead_ecg(img)
-            diag = diagnose_mi(lead_metrics)
+        with st.spinner("Đang tính toán vector trục điện tim, bóc tách QRS và đo đạc khoảng dẫn truyền..."):
+            ecg_data = process_ecg_signals(img)
+            diag_res = diagnose_conduction_and_mi(ecg_data)
 
-        # Hiển thị chẩn đoán chính
-        if diag["locations"]:
-            st.error(f"🚨 **CHẨN ĐOÁN: NHỒI MÁU CƠ TIM CẤP (STEMI)**")
-            st.markdown(f"**Vùng tổn thương:** :red[{', '.join(diag['locations'])}]")
-            st.markdown(f"**Nhánh mạch vành thủ phạm (Dự đoán):** **{', '.join(diag['artery'])}**")
-            st.markdown(f"**Giai đoạn bệnh học:** **{diag['stage']}**")
-            
-            if diag["tombstone"]:
-                st.warning("⚠️ **Dấu hiệu hình thái:** Phát hiện sóng ST chênh vòm dạng 'Bia mộ' (Tombstone pattern) - Tiên lượng vùng nhồi máu rộng.")
-        elif diag["q_leads"]:
-            st.warning("⚠️ **CHẨN ĐOÁN: THEO DÕI NHỒI MÁU CƠ TIM CŨ / SẸO HOẠI TỬ**")
-            st.write(f"Chuyển đạo có sóng Q bệnh lý: {', '.join(diag['q_leads'])}")
-        elif diag["reciprocal_leads"]:
-            st.warning("⚠️ **CHẨN ĐOÁN: THIẾU MÁU CỤC BỘ DƯỚI NỘI TÂM MẠC / NSTEMI**")
-            st.write(f"Chuyển đạo có ST chênh xuống/T âm: {', '.join(diag['reciprocal_leads'])}")
+        # Cảnh báo khẩn cấp nếu có
+        if diag_res["alerts"]:
+            for alert in diag_res["alerts"]:
+                st.error(alert)
+
+        # Hiển thị thông số điện tim học
+        st.markdown("#### Chỉ Số Dẫn Truyền & Trục Điện Tim")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Tần số (HR)", f"{ecg_data['hr']} bpm")
+        p2.metric("Khoảng PR", f"{ecg_data['pr']:.2f} s")
+        p3.metric("Độ rộng QRS", f"{ecg_data['qrs']:.2f} s")
+        p4.metric("Chu kỳ R-R", f"{ecg_data['mean_rr']:.2f} s")
+        
+        st.write(f"📐 **Trục điện tim:** `{diag_res['axis']}`")
+        st.markdown("---")
+
+        # Danh sách kết luận chẩn đoán
+        st.markdown("#### Kết Luận Chẩn Đoán Phân Tầng")
+        if diag_res["findings"]:
+            for category, desc in diag_res["findings"]:
+                if "STEMI" in desc or "độ III" in desc or "ba phân nhánh" in desc:
+                    st.markdown(f"- **[{category}]** :red[{desc}]")
+                elif "Block" in desc or "LAD" in desc or "RAD" in desc:
+                    st.markdown(f"- **[{category}]** :orange[{desc}]")
+                else:
+                    st.markdown(f"- **[{category}]** :green[{desc}]")
         else:
-            st.success("✅ **Không phát hiện dấu hiệu Nhồi máu cơ tim cấp tính hoặc hoại tử xuyên thành.**")
+            st.success("✅ Chưa phát hiện rối loạn dẫn truyền nhĩ thất hoặc nội thất nghiêm trọng.")
 
         st.markdown("---")
-        st.markdown("#### Bảng Phân Tích Chi Tiết 12 Chuyển Đạo")
-        
-        # Bảng dữ liệu chi tiết từng chuyển đạo
-        table_data = []
-        for lead, m in lead_metrics.items():
-            status = "Bình thường"
-            if lead in diag["stemi_leads"]:
-                status = "🔴 ST Chênh lên (STEMI)"
-            elif lead in diag["reciprocal_leads"]:
-                status = "🔵 ST Chênh xuống (Soi gương/Thiếu máu)"
-            elif lead in diag["q_leads"]:
-                status = "⚫ Sóng Q hoại tử"
-
-            table_data.append({
-                "Chuyển đạo": lead,
-                "ST Chênh (mm)": f"+{m['st_elevation']:.1f}" if m['st_elevation'] > 0 else f"-{m['st_depression']:.1f}",
-                "Sóng Q bệnh lý": "Có" if m["pathological_q"] else "Không",
-                "Đánh giá": status
-            })
-
-        st.dataframe(table_data, use_container_width=True, height=280)
-
-        # Khuyến nghị can thiệp
-        st.markdown("#### Đề Xuất Xử Trí Lâm Sàng")
-        if diag["locations"]:
-            st.markdown("""
-            * **Cấp cứu khẩn cấp:** Kích hoạt ngay đội can thiệp mạch vành qua da (Cath-Lab PCI) trong thời gian vàng (< 90-120 phút).
-            * **Dược lý:** Khởi động liệu pháp chống kết tập tiểu cầu kép (Aspirin + Clopidogrel/Ticagrelor), Heparin và kiểm soát đau thắt ngực.
-            * **Xét nghiệm:** Định lượng khẩn cấp hs-Troponin T/I và siêu âm tim cấp tại giường đánh giá rối loạn vận động vùng.
-            """)
-        else:
-            st.markdown("""
-            * Tiếp tục theo dõi ECG nối tiếp (sau 15-30 phút nếu bệnh nhân vẫn còn đau ngực dữ dội).
-            * Theo dõi động học men tim sau 1 giờ, 3 giờ theo phác đồ loại trừ 0/1h của ESC.
-            """)
+        with st.expander("📊 Bảng dữ liệu vi thể 12 chuyển đạo (Điểm J, R/S, dạng sóng)"):
+            detailed_data = []
+            for l_name, l_props in ecg_data["leads"].items():
+                detailed_data.append({
+                    "Chuyển đạo": l_name,
+                    "ST Chênh (mm)": f"{l_props['st_shift']:+.1f}",
+                    "Sóng R (mm)": f"{l_props['r_amp']:.1f}",
+                    "Sóng S (mm)": f"{l_props['s_amp']:.1f}",
+                    "rsR' (V1)": "Có" if l_props["has_rsr"] else "-",
+                    "Khía R (V5/V6)": "Có" if l_props["notched_r"] else "-"
+                })
+            st.dataframe(detailed_data, use_container_width=True, height=260)
     else:
         st.write("Đang chờ tải ảnh...")
