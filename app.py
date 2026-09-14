@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 st.title("🫀 Hệ Thống AI Chẩn Đoán ECG Chuyên Khoa Toàn Diện (YDS 2026)")
-st.caption("Cập nhật chế độ nhập thủ công Block AV, Block nhánh, Block phân nhánh, Block xoang nhĩ, Trục điện tim & Bệnh mạch vành YDS 2026")
+st.caption("Chuẩn hóa nhịp tim trên DII kéo dài; Phân tầng Block dẫn truyền & Phì đại buồng tim dựa trên công thức giải tích và hình thái học YDS 2026")
 
 LEAD_GRID = [
     ["I",   "aVR", "V1", "V4"],
@@ -123,6 +123,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         r_val = max(0.0, (sig[r] / px_per_mv) * 10.0)
         r_amps.append(r_val)
 
+        # Sóng Q
         q_zone = sig[max(0, r - int(px_per_sec * 0.08)):r]
         if len(q_zone) > 0 and np.min(q_zone) < 0:
             q_peak_idx = np.argmin(q_zone)
@@ -135,6 +136,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             q_amps.append(0.0)
             q_durs.append(0.0)
 
+        # Sóng S & Điểm J
         s_search = sig[r:min(len(sig), r + int(px_per_sec * 0.14))]
         if len(s_search) > 2:
             min_s_idx = np.argmin(s_search)
@@ -161,6 +163,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             s_amps.append(0.0)
             r_to_s_times.append(0.06)
 
+        # ST chênh
         st_shift_mm = (sig[j_idx] / px_per_mv) * 10.0
         st_shifts.append(st_shift_mm)
         j80_idx = min(len(sig) - 1, j_idx + int(px_per_sec * 0.07))
@@ -168,6 +171,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         slope_diff = st_j80_shift - st_shift_mm
         st_slopes.append("upsloping" if slope_diff > 0.4 else ("downsloping" if slope_diff < -0.4 else "horizontal"))
 
+        # Sóng T
         t_zone = sig[min(len(sig) - 1, r + int(px_per_sec * 0.10)):min(len(sig), r + int(px_per_sec * 0.35))]
         if len(t_zone) > 6:
             t_max, t_min = np.max(t_zone), np.min(t_zone)
@@ -185,6 +189,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             t_amps.append(0.0)
             t_morphs.append("normal")
 
+        # Độ rộng QRS và VAT
         left_idx = r
         while left_idx > max(0, r - int(px_per_sec * 0.12)) and sig[left_idx] > 0.15 * sig[r]:
             left_idx -= 1
@@ -195,6 +200,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         qrs_widths.append(measured_qrs)
         vats.append((r - left_idx) / px_per_sec)
 
+        # Sóng Delta
         delta_zone = sig[left_idx:r]
         if len(delta_zone) > 5:
             first_half = delta_zone[:len(delta_zone)//2]
@@ -204,6 +210,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             if 0 < s1 < 0.55 * s2 and len(delta_zone) / px_per_sec >= 0.035:
                 has_delta = True
 
+        # Sóng P và khoảng PR
         p_zone_start = max(0, r - int(px_per_sec * 0.38))
         p_zone_end = max(0, r - int(px_per_sec * 0.06))
         p_zone = sig[p_zone_start:p_zone_end]
@@ -236,6 +243,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
                     p_neg_amps.append(0.0)
                     p_neg_durs.append(0.0)
 
+        # Sóng P retro & Khoảng RP
         retro_p_zone = sig[right_idx:min(len(sig), right_idx + int(px_per_sec * 0.22))]
         if len(retro_p_zone) > 4:
             retro_pks, _ = find_peaks(np.abs(retro_p_zone), prominence=0.45)
@@ -247,6 +255,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
                 if retro_p_zone[retro_pks[0]] > 0 and rp_dur < 0.09:
                     pseudo_r_prime = True
 
+        # Tai thỏ rsR' ở V1
         sub_complex = sig[max(0, r - int(px_per_sec * 0.03)):min(len(sig), r + int(px_per_sec * 0.10))]
         if len(sub_complex) > 5:
             local_pks, _ = find_peaks(sub_complex, distance=int(px_per_sec * 0.020), prominence=2.0)
@@ -333,6 +342,7 @@ def process_ecg_dataset(pil_img: Image.Image):
                 all_pr_intervals.extend(m["pr_list"])
             all_qrs_measurements.extend(m["qrs_list"])
 
+    # THUẬT TOÁN ĐO DII KÉO DÀI (RHYTHM STRIP)
     dii_long_roi = clean_bin[h_ecg:, :]
     dii_rrs = []
     if dii_long_roi.shape[0] > 15:
@@ -346,6 +356,7 @@ def process_ecg_dataset(pil_img: Image.Image):
             if len(pks) >= 2:
                 dii_rrs = [r for r in (np.diff(pks) / px_per_sec) if 0.20 <= r <= 2.2]
 
+    # Nếu không có dải nhịp đáy, lấy chuyển đạo DII chuẩn ở hàng 2 cột 1
     if len(dii_rrs) < 2:
         dii_rrs = [rr for rr in leads.get("II", {}).get("rr_intervals", []) if 0.20 <= rr <= 2.2]
 
@@ -441,6 +452,7 @@ class ECGClinicalAnalyzer:
     def evaluate_conduction(self):
         d1, d2, d3, avf = self.leads.get("I", {}), self.leads.get("II", {}), self.leads.get("III", {}), self.leads.get("aVF", {})
 
+        # TÍNH TOÁN TRỤC ĐIỆN TIM
         if self.manual_override.get("axis_calc_mode") == "Tính theo biên độ DI và aVF":
             net_d1 = self.manual_override.get("net_d1", 0.0)
             net_avf = self.manual_override.get("net_avf", 0.0)
@@ -481,6 +493,7 @@ class ECGClinicalAnalyzer:
         else:
             self.axis_txt = "Trục vô định (Tây Bắc: -90° đến 180°)"
 
+        # ---------------- BLOCK NHĨ THẤT (GHI ĐÈ THỦ CÔNG) ----------------
         m_av = self.manual_override.get("av_block_choice", "Tự động")
         av_diag = None
 
@@ -529,6 +542,7 @@ class ECGClinicalAnalyzer:
         if av_diag:
             self.findings.append(("Block Nhĩ Thất", av_diag))
 
+        # ---------------- BLOCK XOANG NHĨ ----------------
         m_sa = self.manual_override.get("sa_block_choice", "Tự động")
         if m_sa == "Block xoang nhĩ độ II Type 1":
             self.findings.append(("Block Xoang Nhĩ", "Block xoang nhĩ độ II type 1: Khoảng PP và RR ngắn dần cho đến khi có khoảng nghỉ mất hẳn sóng P (< 2 x PP)"))
@@ -538,6 +552,7 @@ class ECGClinicalAnalyzer:
             self.findings.append(("Hội chứng suy nút xoang", "Khoảng ngưng xoang kéo dài > 3 giây - Nguy cơ ngất Adams-Stokes"))
             self.alerts.append("🚨 CẢNH BÁO: NGƯNG XOANG > 3 GIÂY - CHỈ ĐỊNH TẠO NHỊP")
 
+        # ---------------- BLOCK NHÁNH & PHÂN NHÁNH ----------------
         m_bbb = self.manual_override.get("bbb_choice", "Tự động")
         m_fasc = self.manual_override.get("fascicular_choice", "Tự động")
 
@@ -606,6 +621,7 @@ class ECGClinicalAnalyzer:
                     lpfb = True
                     self.findings.append(("Block Phân Nhánh", "Block phân nhánh trái sau (LPFB): Trục lệch quá phải (≥ 120°); DI, aVL dạng rS; DII, DIII, aVF dạng qR"))
 
+        # Block 2 & 3 phân nhánh
         if rbbb_type and "Complete" in rbbb_type:
             if lafb:
                 if av_diag and "độ I" in av_diag:
@@ -844,9 +860,6 @@ class ECGClinicalAnalyzer:
         elif {"V1", "V2"}.issubset(st_set):
             stemi_regions.append("Vách liên thất (Septal: V1-V2)")
             culprit_artery.append("Nhánh vách của LAD")
-        elif {"V3", "V4"}.issubset(st_set):
-            stemi_regions.append("Thành trước (Anterior: V3-V4)")
-            culprit_artery.append("LAD đoạn giữa")
 
         if {"I", "aVL"}.issubset(st_set) and not {"V5", "V6"}.intersection(st_set):
             recip = " (Soi gương ở DII, DIII, aVF)" if len({"II", "III", "aVF"}.intersection(dep_set)) >= 1 else ""
@@ -902,6 +915,7 @@ class ECGClinicalAnalyzer:
         avl, avr, v1, v2 = self.leads.get("aVL", {}), self.leads.get("aVR", {}), self.leads.get("V1", {}), self.leads.get("V2", {})
         v3, v4, v5, v6 = self.leads.get("V3", {}), self.leads.get("V4", {}), self.leads.get("V5", {}), self.leads.get("V6", {})
 
+        # LỚN NHĨ
         m_atrial = self.manual_override.get("atrial_override", "Tự động")
         if m_atrial == "Lớn nhĩ phải (P phế)":
             self.findings.append(("Lớn buồng tim", "Lớn nhĩ phải (P phế): Sóng P cao ≥ 2.5 mm ở DII/DIII/aVF"))
@@ -928,6 +942,7 @@ class ECGClinicalAnalyzer:
             elif is_lah:
                 self.findings.append(("Lớn buồng tim", "Lớn nhĩ trái (P nhĩ): Sóng P ở DII có dạng 2 đỉnh (lưng lạc đà) rộng > 0.11s; tại V1 pha âm rộng > 0.04s và sâu > 1 mm"))
 
+        # DÀY THẤT
         s_v1 = self.manual_override["sv1"] if self.manual_override.get("sv1", 0.0) > 0 else v1.get("s_amp", 0.0)
         r_v5 = self.manual_override["rv5"] if self.manual_override.get("rv5", 0.0) > 0 else v5.get("r_amp", 0.0)
         r_v6 = self.manual_override["rv6"] if self.manual_override.get("rv6", 0.0) > 0 else v6.get("r_amp", 0.0)
