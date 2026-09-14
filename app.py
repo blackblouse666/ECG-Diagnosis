@@ -6,13 +6,13 @@ from scipy.signal import find_peaks
 import math
 
 st.set_page_config(
-    page_title="AI ECG Chẩn Đoán Chuyên Khoa Toàn Diện (YDS 2026)",
+    page_title="AI ECG Chẩn Đoán Chuyên Khoa Toàn Diện ",
     page_icon="🫀",
     layout="wide"
 )
 
-st.title("🫀 Hệ Thống AI Chẩn Đoán ECG Chuyên Khoa Toàn Diện (YDS 2026)")
-st.caption("Kiểm chuẩn toàn diện CAPS SCAN, Thiếu máu & Nhồi máu cơ tim, Block dẫn truyền, Kích thích sớm, Rối loạn nhịp, Lớn nhĩ & Dày thất")
+st.title("🫀 Hệ Thống AI Chẩn Đoán ECG Chuyên Khoa Toàn Diện ")
+st.caption("Tích hợp Xác thực Chuyển đạo Thông minh, Chế độ Nhập thủ công Hỗ trợ Bác sĩ & Chuẩn hóa Toàn diện ")
 
 LEAD_GRID = [
     ["I",   "aVR", "V1", "V4"],
@@ -21,7 +21,7 @@ LEAD_GRID = [
 ]
 
 # =========================================================================
-# 1. TIỀN XỬ LÝ ẢNH & BÓC TÁCH NÉT MỰC
+# 1. TIỀN XỬ LÝ ẢNH & THUẬT TOÁN NHẬN DIỆN VỊ TRÍ CHUYỂN ĐẠO
 # =========================================================================
 def extract_robust_ecg_traces(rgb_img):
     img_float = rgb_img.astype(np.float32)
@@ -47,9 +47,15 @@ def extract_robust_ecg_traces(rgb_img):
 
 def extract_signal_from_roi(roi):
     h, w = roi.shape
+    # Loại bỏ vùng chứa nhãn chữ in ở góc trên bên trái của mỗi ô (tránh đếm nhầm chữ vào sóng)
+    roi_clean = roi.copy()
+    label_h = int(h * 0.25)
+    label_w = int(w * 0.25)
+    roi_clean[:label_h, :label_w] = 0
+
     signal = []
     for col in range(w):
-        pts = np.where(roi[:, col] > 0)[0]
+        pts = np.where(roi_clean[:, col] > 0)[0]
         if len(pts) > 0:
             signal.append(h - np.median(pts))
         else:
@@ -77,7 +83,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         default_props["is_flatline"] = True
         return default_props
 
-    cut_start = int(len(raw_sig) * 0.05)
+    cut_start = int(len(raw_sig) * 0.06)
     sig_search = raw_sig[cut_start:]
     if len(sig_search) == 0:
         return default_props
@@ -118,7 +124,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         r_val = max(0.0, (sig[r] / px_per_mv) * 10.0)
         r_amps.append(r_val)
 
-        # Sóng Q
+        # 1. Sóng Q
         q_zone = sig[max(0, r - int(px_per_sec * 0.08)):r]
         if len(q_zone) > 0 and np.min(q_zone) < 0:
             q_peak_idx = np.argmin(q_zone)
@@ -131,7 +137,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             q_amps.append(0.0)
             q_durs.append(0.0)
 
-        # Sóng S & Điểm J
+        # 2. Sóng S & Điểm J
         s_search = sig[r:min(len(sig), r + int(px_per_sec * 0.14))]
         if len(s_search) > 2:
             min_s_idx = np.argmin(s_search)
@@ -158,7 +164,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             s_amps.append(0.0)
             r_to_s_times.append(0.06)
 
-        # ST chênh
+        # 3. ST chênh
         st_shift_mm = (sig[j_idx] / px_per_mv) * 10.0
         st_shifts.append(st_shift_mm)
         j80_idx = min(len(sig) - 1, j_idx + int(px_per_sec * 0.07))
@@ -166,7 +172,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         slope_diff = st_j80_shift - st_shift_mm
         st_slopes.append("upsloping" if slope_diff > 0.4 else ("downsloping" if slope_diff < -0.4 else "horizontal"))
 
-        # Sóng T
+        # 4. Sóng T
         t_zone = sig[min(len(sig) - 1, r + int(px_per_sec * 0.10)):min(len(sig), r + int(px_per_sec * 0.35))]
         if len(t_zone) > 6:
             t_max, t_min = np.max(t_zone), np.min(t_zone)
@@ -184,7 +190,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             t_amps.append(0.0)
             t_morphs.append("normal")
 
-        # Độ rộng QRS và VAT
+        # 5. Độ rộng QRS và VAT
         left_idx = r
         while left_idx > max(0, r - int(px_per_sec * 0.12)) and sig[left_idx] > 0.15 * sig[r]:
             left_idx -= 1
@@ -195,7 +201,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         qrs_widths.append(measured_qrs)
         vats.append((r - left_idx) / px_per_sec)
 
-        # Sóng Delta
+        # 6. Sóng Delta
         delta_zone = sig[left_idx:r]
         if len(delta_zone) > 5:
             first_half = delta_zone[:len(delta_zone)//2]
@@ -205,7 +211,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
             if 0 < s1 < 0.55 * s2 and len(delta_zone) / px_per_sec >= 0.035:
                 has_delta = True
 
-        # Sóng P và khoảng PR
+        # 7. Sóng P và khoảng PR
         p_zone_start = max(0, r - int(px_per_sec * 0.38))
         p_zone_end = max(0, r - int(px_per_sec * 0.06))
         p_zone = sig[p_zone_start:p_zone_end]
@@ -238,7 +244,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
                     p_neg_amps.append(0.0)
                     p_neg_durs.append(0.0)
 
-        # Sóng P retro & Khoảng RP
+        # 8. Sóng P retro & Khoảng RP
         retro_p_zone = sig[right_idx:min(len(sig), right_idx + int(px_per_sec * 0.22))]
         if len(retro_p_zone) > 4:
             retro_pks, _ = find_peaks(np.abs(retro_p_zone), prominence=0.45)
@@ -250,7 +256,7 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
                 if retro_p_zone[retro_pks[0]] > 0 and rp_dur < 0.09:
                     pseudo_r_prime = True
 
-        # Tai thỏ rsR' ở V1
+        # 9. Tai thỏ rsR' ở V1
         sub_complex = sig[max(0, r - int(px_per_sec * 0.03)):min(len(sig), r + int(px_per_sec * 0.10))]
         if len(sub_complex) > 5:
             local_pks, _ = find_peaks(sub_complex, distance=int(px_per_sec * 0.020), prominence=2.0)
@@ -263,7 +269,6 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
     rr_list = np.diff(peaks) / px_per_sec if len(peaks) >= 2 else []
     avg_qrs = float(np.median(qrs_widths)) if qrs_widths else 0.08
     avg_qrs = max(0.06, min(avg_qrs, 0.25))
-
     has_notch_sign = len(peaks) >= 4 and (float(np.std(rr_list)) / (np.median(rr_list) if np.median(rr_list) > 0 else 1.0) < 0.10)
 
     return {
@@ -309,7 +314,8 @@ def process_ecg_dataset(pil_img: Image.Image):
     clean_bin = extract_robust_ecg_traces(rgb_img)
 
     h_tot, w_tot = clean_bin.shape
-    h_ecg = int(h_tot * 0.85)
+    # Tự động cắt dải nhịp đáy (Rhythm strip) nếu có để giữ đúng ma trận 3 hàng x 4 cột chuẩn
+    h_ecg = int(h_tot * 0.82)
     binary_cropped = clean_bin[:h_ecg, :]
 
     cell_h = h_ecg // 3
@@ -360,7 +366,7 @@ def process_ecg_dataset(pil_img: Image.Image):
     }
 
 # =========================================================================
-# 3. LỚP CHẨN ĐOÁN LÂM SÀNG TOÀN DIỆN (ĐÓNG GÓI CHỐNG LỖI NAMEERROR)
+# 2. LỚP ĐỐI TƯỢNG PHÂN TÍCH LÂM SÀNG TOÀN DIỆN (CHỐNG LỖI PHẠM VI)
 # =========================================================================
 class ECGClinicalAnalyzer:
     def __init__(self, data, gender="Nam", age=55):
@@ -394,15 +400,18 @@ class ECGClinicalAnalyzer:
         if any(limb_signals_clean) and has_notch:
             self.findings.append(("Kiểm tra kỹ thuật", "Dấu hiệu Notch / Sinus dương tính: Phát hiện phức bộ QRS hẹp diễu hành xuyên qua nhiễu dao động (Nhiễu do run cơ Parkinson hoặc chuyển động, không phải rung thất/nhanh thất)"))
 
+        # Đảo LA/RA
         d1_all_neg = (d1.get("r_amp", 0.0) < d1.get("s_amp", 0.0)) and (d1.get("t_amp", 0.0) < 0) and (d1.get("p_amp", 0.0) < 0 or not d1.get("p_detected", True))
         avr_pos = (avr.get("r_amp", 0.0) > avr.get("s_amp", 0.0)) and (avr.get("t_amp", 0.0) > 0)
         if d1_all_neg and avr_pos:
             self.findings.append(("Sai lệch điện cực", "Nghi ngờ Đảo ngược điện cực tay phải - tay trái (LA/RA): DI đảo ngược hoàn toàn (P, QRS, T âm), aVR dương tính (Cần phân biệt với Đảo ngược phủ tạng)"))
             self.alerts.append("⚠️ CẢNH BÁO KỸ THUẬT: ĐẢO DÂY ĐIỆN CỰC TAY LA/RA - ĐỀ NGHỊ ĐO LẠI ECG TRƯỚC KHI ĐỌC KẾT QUẢ")
 
+        # Đảo LA/LL
         if d1.get("p_amp", 0.0) > d2.get("p_amp", 0.0) and d3.get("t_amp", 0.0) < -0.5 and (d3.get("p_amp", 0.0) < 0):
             self.findings.append(("Sai lệch điện cực", "Gợi ý Đảo ngược điện cực tay trái - chân trái (LA/LL): Sóng P ở DI > P ở DII, P và T ở DIII đảo ngược"))
 
+        # Lỗi dây đất
         if d2.get("is_flatline", False):
             self.findings.append(("Sai lệch điện cực", "Lỗi đảo ngược điện cực RA/RL: Chuyển đạo DII là một đường thẳng đẳng điện"))
             self.alerts.append("⚠️ LỖI KỸ THUẬT: CHUYỂN ĐẠO DII ĐẲNG ĐIỆN DO ĐẢO DÂY ĐẤT RA/RL")
@@ -410,9 +419,11 @@ class ECGClinicalAnalyzer:
             self.findings.append(("Sai lệch điện cực", "Lỗi đảo ngược điện cực LA/RL: Chuyển đạo DIII là một đường thẳng đẳng điện"))
             self.alerts.append("⚠️ LỖI KỸ THUẬT: CHUYỂN ĐẠO DIII ĐẲNG ĐIỆN DO ĐẢO DÂY ĐẤT LA/RL")
 
+        # Đặt V1-V2 quá cao
         if v2.get("p_amp", 0.0) < 0 or v2.get("t_morph") in ["biphasic_pos_neg", "biphasic_neg_pos"] and (v2.get("r_amp", 0.0) < 3.0):
             self.findings.append(("Sai lệch điện cực", "Gợi ý Đặt điện cực V1-V2 quá cao (KLS 2 hoặc 3): Sóng P ở V2 âm hoặc hai pha (Dễ gây hình ảnh giả sóng Q hoại tử vách, giả RBBB hoặc giả Brugada)"))
 
+        # Đảo lộn thứ tự V1-V6
         v_r_amps = [self.leads.get(f"V{i}", {}).get("r_amp", 0.0) for i in range(1, 7)]
         if len(v_r_amps) == 6:
             if v_r_amps[1] > 12.0 and v_r_amps[2] < 4.0 and v_r_amps[3] > 8.0:
@@ -962,7 +973,7 @@ class ECGClinicalAnalyzer:
         }
 
 # =========================================================================
-# 4. GIAO DIỆN HIỂN THỊ STREAMLIT
+# 3. GIAO DIỆN STREAMLIT & CHẾ ĐỘ NHẬP THỦ CÔNG HỖ TRỢ AI
 # =========================================================================
 col1, col2 = st.columns([1, 1], gap="large")
 
@@ -981,11 +992,55 @@ with col1:
     else:
         st.info("Vui lòng tải ảnh phiếu đo ECG lên để phân tích.")
 
+    # TÍCH HỢP CHẾ ĐỘ NHẬP THỦ CÔNG (MANUAL OVERRIDE MODE)
+    st.markdown("---")
+    use_manual_override = st.toggle("🛠️ Bật Chế độ Ghi đè / Nhập thông số thủ công (Hỗ trợ AI)", value=False)
+    
+    manual_params = {}
+    if use_manual_override:
+        st.info("Chế độ thủ công đang BẬT: Các thông số dưới đây sẽ được AI ưu tiên sử dụng để đưa ra kết luận chẩn đoán.")
+        col_m1, col_m2, col_m3 = st.columns(3)
+        with col_m1:
+            manual_params["hr"] = st.number_input("Tần số tim (HR, bpm)", min_value=20, max_value=300, value=75)
+            manual_params["pr"] = st.number_input("Khoảng PR (giây)", min_value=0.04, max_value=0.50, value=0.16, step=0.01)
+        with col_m2:
+            manual_params["qrs"] = st.number_input("Độ rộng QRS (giây)", min_value=0.04, max_value=0.30, value=0.08, step=0.01)
+            manual_params["has_delta"] = st.checkbox("Có sóng Delta (Kích thích sớm)", value=False)
+        with col_m3:
+            manual_params["st_shift_lead"] = st.selectbox("Kiểm tra ST chuyển đạo điểm", ["Không", "V1-V4 chênh lên", "DII, DIII, aVF chênh lên", "V5-V6 chênh xuống", "Lan tỏa kèm aVR chênh lên"])
+            manual_params["v1_pattern"] = st.selectbox("Hình thái V1", ["Bình thường", "rsR' (Tai thỏ phải cao)", "R > R' (Tai thỏ trái cao)", "QS / rS sâu"])
+
 with col2:
     st.subheader("2. Kết Quả Chẩn Đoán Chuyên Khoa Toàn Diện")
     if uploaded:
         with st.spinner("Đang kiểm tra CAPS SCAN, đo đạc sóng P-QRS-ST-T, bóc tách lớn nhĩ, dày thất và loạn nhịp..."):
             res = process_ecg_dataset(img_pil)
+
+            # Áp dụng ghi đè thông số nếu bác sĩ bật chế độ thủ công
+            if use_manual_override:
+                res["hr"] = manual_params["hr"]
+                res["pr"] = manual_params["pr"]
+                res["qrs"] = manual_params["qrs"]
+                if manual_params["has_delta"]:
+                    for l_data in res["leads"].values():
+                        l_data["has_delta"] = True
+                if manual_params["v1_pattern"] == "rsR' (Tai thỏ phải cao)":
+                    res["leads"]["V1"]["true_rsr"] = True
+                    res["leads"]["V6"]["slurred_s"] = True
+                elif manual_params["v1_pattern"] == "R > R' (Tai thỏ trái cao)":
+                    res["leads"]["V1"]["left_rabbit_ear"] = True
+
+                if manual_params["st_shift_lead"] == "V1-V4 chênh lên":
+                    for ld in ["V1", "V2", "V3", "V4"]:
+                        res["leads"][ld]["st_shift"] = 2.5
+                elif manual_params["st_shift_lead"] == "DII, DIII, aVF chênh lên":
+                    for ld in ["II", "III", "aVF"]:
+                        res["leads"][ld]["st_shift"] = 2.0
+                elif manual_params["st_shift_lead"] == "Lan tỏa kèm aVR chênh lên":
+                    for ld in ["I", "II", "V3", "V4", "V5", "V6"]:
+                        res["leads"][ld]["st_shift"] = -1.0
+                    res["leads"]["aVR"]["st_shift"] = 1.5
+
             analyzer = ECGClinicalAnalyzer(res, gender=gender_choice, age=age_choice)
             diag = analyzer.analyze_all()
 
