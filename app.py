@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 st.title("🫀 Hệ Thống AI Chẩn Đoán ECG Chuyên Khoa Toàn Diện (YDS 2026)")
-st.caption("Chuẩn hóa nhịp tim theo DII; Bộ công cụ hỗ trợ nhập trực tiếp Sokolow-Lyon, Cornell, Trục điện tim & Hình thái ST")
+st.caption("Khắc phục triệt để StreamlitError; Tự động tính toán Trục điện tim theo biên độ DI/DII/aVF; Tần số tim DII & Bộ tiêu chuẩn YDS 2026")
 
 LEAD_GRID = [
     ["I",   "aVR", "V1", "V4"],
@@ -268,7 +268,6 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
     rr_list = np.diff(peaks) / px_per_sec if len(peaks) >= 2 else []
     avg_qrs = float(np.median(qrs_widths)) if qrs_widths else 0.08
     avg_qrs = max(0.06, min(avg_qrs, 0.25))
-
     has_notch_sign = len(peaks) >= 4 and (float(np.std(rr_list)) / (np.median(rr_list) if np.median(rr_list) > 0 else 1.0) < 0.10)
 
     return {
@@ -309,9 +308,6 @@ def analyze_lead_morphology(raw_sig, px_per_sec, px_per_mv):
         "qrs_list": qrs_widths
     }
 
-# =========================================================================
-# 2. XỬ LÝ TOÀN BỘ ẢNH & ƯU TIÊN CHUYỂN ĐẠO DII TÍNH NHỊP TIM
-# =========================================================================
 def process_ecg_dataset(pil_img: Image.Image):
     rgb_img = np.array(pil_img.convert("RGB"))
     clean_bin = extract_robust_ecg_traces(rgb_img)
@@ -343,7 +339,7 @@ def process_ecg_dataset(pil_img: Image.Image):
                 all_pr_intervals.extend(m["pr_list"])
             all_qrs_measurements.extend(m["qrs_list"])
 
-    # THUẬT TOÁN ƯU TIÊN CHUYỂN ĐẠO DII LÀM CHUẨN VÀNG TÍNH HR
+    # THUẬT TOÁN ƯU TIÊN CHUYỂN ĐẠO DII TÍNH HR
     d2_rrs = [rr for rr in leads.get("II", {}).get("rr_intervals", []) if 0.20 <= rr <= 2.2]
     valid_rrs = [rr for rr in all_rr_intervals if 0.20 <= rr <= 2.2]
 
@@ -379,7 +375,7 @@ def process_ecg_dataset(pil_img: Image.Image):
     }
 
 # =========================================================================
-# 3. LỚP ĐỐI TƯỢNG PHÂN TÍCH LÂM SÀNG TOÀN DIỆN (YDS 2026)
+# 2. LỚP ĐỐI TƯỢNG PHÂN TÍCH LÂM SÀNG TOÀN DIỆN (YDS 2026)
 # =========================================================================
 class ECGClinicalAnalyzer:
     def __init__(self, data, gender="Nam", age=55, manual_override=None):
@@ -399,6 +395,7 @@ class ECGClinicalAnalyzer:
         self.findings = []
         self.alerts = []
         self.axis_txt = "Trục trung gian sinh lý"
+        self.calculated_axis_deg = None
         self.sokolow_lv = 0.0
         self.sokolow_rv = 0.0
         self.cornell = 0.0
@@ -435,35 +432,50 @@ class ECGClinicalAnalyzer:
 
     def evaluate_conduction(self):
         d1, d2, d3, avf = self.leads.get("I", {}), self.leads.get("II", {}), self.leads.get("III", {}), self.leads.get("aVF", {})
-        net_d1 = d1.get("r_amp", 0.0) - d1.get("s_amp", 0.0)
-        net_d2 = d2.get("r_amp", 0.0) - d2.get("s_amp", 0.0)
-        net_avf = avf.get("r_amp", 0.0) - avf.get("s_amp", 0.0)
+
+        # TÍNH TOÁN TRỤC ĐIỆN TIM CHÍNH XÁC THEO BIÊN ĐỘ ĐẠI SỐ
+        if self.manual_override.get("axis_calc_mode") == "Tính theo biên độ DI và aVF":
+            net_d1 = self.manual_override.get("net_d1", 0.0)
+            net_avf = self.manual_override.get("net_avf", 0.0)
+            net_d2 = self.manual_override.get("net_d2", 0.0)
+            net_d3 = self.manual_override.get("net_d3", 0.0)
+            
+            # Góc Alpha = arctan(2 * Net_aVF / (sqrt(3) * Net_DI))
+            try:
+                rad = math.atan2(2.0 * net_avf, math.sqrt(3.0) * net_d1)
+                self.calculated_axis_deg = int(round(math.degrees(rad)))
+            except:
+                self.calculated_axis_deg = 0
+        else:
+            net_d1 = d1.get("r_amp", 0.0) - d1.get("s_amp", 0.0)
+            net_d2 = d2.get("r_amp", 0.0) - d2.get("s_amp", 0.0)
+            net_d3 = d3.get("r_amp", 0.0) - d3.get("s_amp", 0.0)
+            net_avf = avf.get("r_amp", 0.0) - avf.get("s_amp", 0.0)
 
         is_extreme_lad, is_extreme_rad = False, False
-        if "axis_choice" in self.manual_override and self.manual_override["axis_choice"] != "Tự động":
-            self.axis_txt = self.manual_override["axis_choice"]
-            if "quá trái" in self.axis_txt:
+
+        # Phân loại trục chuẩn YDS 2026
+        if net_d1 > 0 and net_avf >= 0:
+            deg_txt = f" ({self.calculated_axis_deg}°)" if self.calculated_axis_deg is not None else ""
+            self.axis_txt = f"Bình thường: 0° đến +90°{deg_txt}"
+        elif net_d1 > 0 and net_avf < 0:
+            if net_d2 < 0:
                 is_extreme_lad = True
-            elif "quá phải" in self.axis_txt:
-                is_extreme_rad = True
-        else:
-            if net_d1 > 0 and net_avf >= 0:
-                self.axis_txt = "Bình thường (0° đến +90°)"
-            elif net_d1 > 0 and net_avf < 0:
-                if net_d2 < 0:
-                    is_extreme_lad = True
-                    self.axis_txt = "Trục lệch quá trái (-30° đến -90°)"
-                else:
-                    self.axis_txt = "Trục lệch trái sinh lý (0° đến -30°)"
-            elif net_d1 <= 0 and net_avf > 0:
-                net_d3 = d3.get("r_amp", 0.0) - d3.get("s_amp", 0.0)
-                if net_d3 > 0 and abs(net_d1) > 2.0:
-                    is_extreme_rad = True
-                    self.axis_txt = "Trục lệch quá phải (≥ +120°)"
-                else:
-                    self.axis_txt = "Trục lệch phải (+90° đến +120°)"
+                deg_txt = f" ({self.calculated_axis_deg}°)" if self.calculated_axis_deg is not None else ""
+                self.axis_txt = f"LAD (Trục lệch quá trái bệnh lý: -30° đến -90°){deg_txt}"
             else:
-                self.axis_txt = "Trục vô định"
+                deg_txt = f" ({self.calculated_axis_deg}°)" if self.calculated_axis_deg is not None else ""
+                self.axis_txt = f"Trục lệch trái sinh lý: 0° đến -30°{deg_txt}"
+        elif net_d1 <= 0 and net_avf > 0:
+            if net_d3 > 0 and abs(net_d1) > 2.0:
+                is_extreme_rad = True
+                deg_txt = f" ({self.calculated_axis_deg}°)" if self.calculated_axis_deg is not None else ""
+                self.axis_txt = f"RAD (Trục lệch quá phải bệnh lý: ≥ +120°){deg_txt}"
+            else:
+                deg_txt = f" ({self.calculated_axis_deg}°)" if self.calculated_axis_deg is not None else ""
+                self.axis_txt = f"Trục lệch phải: +90° đến +120°{deg_txt}"
+        else:
+            self.axis_txt = "Trục vô định (Tây Bắc: -90° đến 180°)"
 
         long_rrs = [r for r in self.rr_list if r > 1.6 * self.mean_rr]
         av_diag = None
@@ -529,7 +541,7 @@ class ECGClinicalAnalyzer:
             d3_rs = (d3.get("s_amp", 0.0) > d3.get("r_amp", 0.0))
             if d1_qr and d3_rs:
                 lafb = True
-                self.findings.append(("Block Phân Nhánh", "Block phân nhánh trái trước (LAFB): Trục lệch quá trái (-30° đến -90°); DI, aVL dạng qR; DII, DIII, aVF dạng rS"))
+                self.findings.append(("Block Phân Nhánh", "Block phân nhánh trái trước (LAFB): Trục lệch quá trái (-30° đến -90°); DI, aVL dạng qR; DII, DIII, aVF dạng rS (DI dương, aVF âm, DII âm)"))
 
         if is_extreme_rad and self.qrs < 0.12:
             d1_rs = (d1.get("s_amp", 0.0) > d1.get("r_amp", 0.0))
@@ -680,7 +692,6 @@ class ECGClinicalAnalyzer:
         hyperacute_t_leads, inverted_t_leads, flat_t_leads, biphasic_t_leads = [], [], [], []
         pathological_q_leads = []
 
-        # Áp dụng ghi đè hình thái ST thủ công nếu có
         m_st_ant = self.manual_override.get("st_anterior", "Tự động")
         m_st_inf = self.manual_override.get("st_inferior", "Tự động")
         m_st_lat = self.manual_override.get("st_lateral", "Tự động")
@@ -782,6 +793,9 @@ class ECGClinicalAnalyzer:
             recip = " (Soi gương ở DII, DIII, aVF)" if len({"II", "III", "aVF"}.intersection(dep_set)) >= 1 else ""
             stemi_regions.append(f"Thành bên cao đơn thuần (High Lateral: DI, aVL){recip}")
             culprit_artery.append("Nhánh D1 của LAD hoặc LCx")
+        elif {"V5", "V6"}.issubset(st_set) and not {"I", "aVL"}.intersection(st_set):
+            stemi_regions.append("Thành bên thấp (Low Lateral: V5-V6)")
+            culprit_artery.append("Đoạn xa LAD (dLAD)")
         elif {"V5", "V6", "I", "aVL"}.issubset(st_set):
             stemi_regions.append("Thành bên toàn bộ (Lateral: V5, V6, DI, aVL)")
             culprit_artery.append("LCx hoặc nhánh D1 của LAD")
@@ -791,6 +805,12 @@ class ECGClinicalAnalyzer:
             recip = " (Soi gương ở aVL, DI, V1-V3)" if len({"aVL", "I", "V1", "V2"}.intersection(dep_set)) >= 1 else ""
             stemi_regions.append(f"Thành dưới (Inferior: {', '.join(sorted(list(inferior_leads)))}){recip}")
             culprit_artery.append("RCA (80%) hoặc LCx (20%)")
+
+        v2_r, v2_s = self.leads.get("V2", {}).get("r_amp", 0.0), self.leads.get("V2", {}).get("s_amp", 0.0)
+        v2_st, v2_t = self.leads.get("V2", {}).get("st_shift", 0.0), self.leads.get("V2", {}).get("t_amp", 0.0)
+        if (v2_s > 0 and v2_r / v2_s > 1.0) and v2_st <= -0.5 and v2_t > 0:
+            stemi_regions.append("Dấu hiệu gián tiếp NMCT Thành sau thực (R/S > 1, ST chênh xuống, T dương ở V2-V3)")
+            culprit_artery.append("RCA hoặc LCx")
 
         if stemi_regions:
             reg_txt = " + ".join(stemi_regions)
@@ -829,7 +849,6 @@ class ECGClinicalAnalyzer:
         avl, avr, v1, v2 = self.leads.get("aVL", {}), self.leads.get("aVR", {}), self.leads.get("V1", {}), self.leads.get("V2", {})
         v3, v4, v5, v6 = self.leads.get("V3", {}), self.leads.get("V4", {}), self.leads.get("V5", {}), self.leads.get("V6", {})
 
-        # Lớn nhĩ
         p_amp_d2 = d2.get("p_amp", 0.0)
         p_dur_d2 = d2.get("p_dur", 0.08)
         p_notched_d2 = d2.get("p_notched", False)
@@ -848,41 +867,14 @@ class ECGClinicalAnalyzer:
         elif is_lah:
             self.findings.append(("Lớn buồng tim", "Lớn nhĩ trái (P nhĩ): Sóng P ở DII có dạng 2 đỉnh (lưng lạc đà) rộng > 0.11s; tại V1 pha âm rộng > 0.04s và sâu > 1 mm"))
 
-        # GHI ĐÈ HOẶC TÍNH TỰ ĐỘNG CHỈ SỐ SOKOLOW-LYON & CORNELL
-        if "sv1" in self.manual_override and self.manual_override["sv1"] > 0:
-            s_v1 = self.manual_override["sv1"]
-        else:
-            s_v1 = v1.get("s_amp", 0.0)
-
-        if "rv5" in self.manual_override and self.manual_override["rv5"] > 0:
-            r_v5 = self.manual_override["rv5"]
-        else:
-            r_v5 = v5.get("r_amp", 0.0)
-
-        if "rv6" in self.manual_override and self.manual_override["rv6"] > 0:
-            r_v6 = self.manual_override["rv6"]
-        else:
-            r_v6 = v6.get("r_amp", 0.0)
-
-        if "ravl" in self.manual_override and self.manual_override["ravl"] > 0:
-            r_avl = self.manual_override["ravl"]
-        else:
-            r_avl = avl.get("r_amp", 0.0)
-
-        if "sv3" in self.manual_override and self.manual_override["sv3"] > 0:
-            s_v3 = self.manual_override["sv3"]
-        else:
-            s_v3 = v3.get("s_amp", 0.0)
-
-        if "rv1" in self.manual_override and self.manual_override["rv1"] > 0:
-            r_v1 = self.manual_override["rv1"]
-        else:
-            r_v1 = v1.get("r_amp", 0.0)
-
-        if "sv5" in self.manual_override and self.manual_override["sv5"] > 0:
-            s_v5 = self.manual_override["sv5"]
-        else:
-            s_v5 = v5.get("s_amp", 0.0)
+        # Ghi đè hoặc tính tự động Sokolow-Lyon & Cornell
+        s_v1 = self.manual_override["sv1"] if self.manual_override.get("sv1", 0.0) > 0 else v1.get("s_amp", 0.0)
+        r_v5 = self.manual_override["rv5"] if self.manual_override.get("rv5", 0.0) > 0 else v5.get("r_amp", 0.0)
+        r_v6 = self.manual_override["rv6"] if self.manual_override.get("rv6", 0.0) > 0 else v6.get("r_amp", 0.0)
+        r_avl = self.manual_override["ravl"] if self.manual_override.get("ravl", 0.0) > 0 else avl.get("r_amp", 0.0)
+        s_v3 = self.manual_override["sv3"] if self.manual_override.get("sv3", 0.0) > 0 else v3.get("s_amp", 0.0)
+        r_v1 = self.manual_override["rv1"] if self.manual_override.get("rv1", 0.0) > 0 else v1.get("r_amp", 0.0)
+        s_v5 = self.manual_override["sv5"] if self.manual_override.get("sv5", 0.0) > 0 else v5.get("s_amp", 0.0)
 
         self.sokolow_lv = s_v1 + max(r_v5, r_v6)
         self.sokolow_rv = r_v1 + max(s_v5, v6.get("s_amp", 0.0))
@@ -964,7 +956,7 @@ class ECGClinicalAnalyzer:
         }
 
 # =========================================================================
-# 4. GIAO DIỆN STREAMLIT & BỘ HỖ TRỢ NHẬP THÔNG SỐ CHUYÊN SÂU
+# 4. GIAO DIỆN STREAMLIT
 # =========================================================================
 col1, col2 = st.columns([1, 1], gap="large")
 
@@ -983,23 +975,34 @@ with col1:
     else:
         st.info("Vui lòng tải ảnh phiếu đo ECG lên để phân tích.")
 
-    # KHUNG NHẬP THỦ CÔNG HỖ TRỢ CHẨN ĐOÁN
+    # KHUNG NHẬP THỦ CÔNG ĐÃ SỬA LỖI VALUE < MIN_VALUE
     st.markdown("---")
     use_manual_override = st.toggle("🛠️ Bật Chế độ Nhập / Tinh chỉnh thông số thủ công (Hỗ trợ AI)", value=False)
     
     manual_data = {}
     if use_manual_override:
-        st.markdown("##### 📌 Tinh chỉnh Dẫn truyền & Trục điện tim")
+        st.markdown("##### 📌 Tần số DII & Dẫn truyền nhĩ thất")
         m_col1, m_col2, m_col3 = st.columns(3)
         with m_col1:
-            manual_data["hr"] = st.number_input("Tần số tim DII (l/p)", min_value=20, max_value=300, value=0, help="Nhập > 0 để ghi đè tần số tim đo tự động")
-            manual_data["pr"] = st.number_input("Khoảng PR (giây)", min_value=0.04, max_value=0.50, value=0.0, step=0.01, help="Nhập > 0 để ghi đè khoảng PR")
+            # Sửa value=75 hợp lệ nằm trong khoảng 20-300
+            manual_data["hr"] = st.number_input("Tần số tim DII (l/p)", min_value=20, max_value=300, value=75, help="Ghi đè tần số tim đo tự động")
         with m_col2:
-            manual_data["qrs"] = st.number_input("Độ rộng QRS (giây)", min_value=0.04, max_value=0.30, value=0.0, step=0.01, help="Nhập > 0 để ghi đè độ rộng QRS")
-            manual_data["axis_choice"] = st.selectbox("Trục điện tim", ["Tự động", "Bình thường (0° đến +90°)", "LAD (Lệch trái sinh lý: 0° đến -30°)", "LAD (Lệch quá trái bệnh lý: -30° đến -90°)", "RAD (Lệch phải: +90° đến +120°)", "RAD (Lệch quá phải bệnh lý: ≥ +120°)", "Trục vô định"])
+            manual_data["pr"] = st.number_input("Khoảng PR (giây)", min_value=0.04, max_value=0.50, value=0.16, step=0.01)
         with m_col3:
-            manual_data["has_delta"] = st.checkbox("Có sóng Delta (WPW)", value=False)
-            manual_data["v1_shape"] = st.selectbox("Hình thái V1", ["Tự động", "Dạng chữ M (rsR' tai thỏ phải)", "R > R' (Tai thỏ trái)", "QS / rS sâu"])
+            manual_data["qrs"] = st.number_input("Độ rộng QRS (giây)", min_value=0.04, max_value=0.30, value=0.08, step=0.01)
+
+        st.markdown("##### 📐 Tính toán Trục điện tim (Nhập biên độ đại số Net = R - S)")
+        manual_data["axis_calc_mode"] = st.radio("Chế độ tính trục:", ["Tự động từ ảnh", "Tính theo biên độ DI và aVF"], horizontal=True)
+        if manual_data["axis_calc_mode"] == "Tính theo biên độ DI và aVF":
+            ax_c1, ax_c2, ax_c3, ax_c4 = st.columns(4)
+            with ax_c1:
+                manual_data["net_d1"] = st.number_input("Net DI (mm)", min_value=-50.0, max_value=50.0, value=8.0, step=0.5, help="Biên độ R trừ S ở DI")
+            with ax_c2:
+                manual_data["net_d2"] = st.number_input("Net DII (mm)", min_value=-50.0, max_value=50.0, value=6.0, step=0.5, help="Biên độ R trừ S ở DII")
+            with ax_c3:
+                manual_data["net_d3"] = st.number_input("Net DIII (mm)", min_value=-50.0, max_value=50.0, value=-2.0, step=0.5, help="Biên độ R trừ S ở DIII")
+            with ax_c4:
+                manual_data["net_avf"] = st.number_input("Net aVF (mm)", min_value=-50.0, max_value=50.0, value=3.0, step=0.5, help="Biên độ R trừ S ở aVF")
 
         st.markdown("##### 📏 Biên độ tính Dày thất (Sokolow-Lyon, Cornell)")
         v_col1, v_col2, v_col3 = st.columns(3)
@@ -1029,7 +1032,6 @@ with col2:
         with st.spinner("Đang tính tần số chuẩn DII, đối chiếu tiêu chuẩn YDS 2026..."):
             res = process_ecg_dataset(img_pil)
 
-            # Áp dụng ghi đè thông số nếu bật chế độ thủ công
             if use_manual_override:
                 if manual_data["hr"] > 0:
                     res["hr"] = int(manual_data["hr"])
@@ -1038,14 +1040,6 @@ with col2:
                     res["pr"] = float(manual_data["pr"])
                 if manual_data["qrs"] > 0:
                     res["qrs"] = float(manual_data["qrs"])
-                if manual_data["has_delta"]:
-                    for l_data in res["leads"].values():
-                        l_data["has_delta"] = True
-                if manual_data["v1_shape"] == "Dạng chữ M (rsR' tai thỏ phải)":
-                    res["leads"]["V1"]["true_rsr"] = True
-                    res["leads"]["V6"]["slurred_s"] = True
-                elif manual_data["v1_shape"] == "R > R' (Tai thỏ trái)":
-                    res["leads"]["V1"]["left_rabbit_ear"] = True
 
             analyzer = ECGClinicalAnalyzer(res, gender=gender_choice, age=age_choice, manual_override=manual_data if use_manual_override else None)
             diag = analyzer.analyze_all()
